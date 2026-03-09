@@ -1,0 +1,235 @@
+networks:
+  ai-net: {}
+
+volumes:
+  milvus_data:
+  minio_data:
+  ollama_models:
+  etcd_data:
+
+services:
+  # =============== ETCD (upstream, distroless) ===============
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.23
+    pull_policy: always
+    container_name: etcd
+    command: >
+      /usr/local/bin/etcd
+      --name s1
+      --data-dir=/etcd-data
+      --listen-client-urls=http://0.0.0.0:2379
+      --advertise-client-urls=http://etcd:2379
+      --listen-peer-urls=http://0.0.0.0:2380
+      --initial-advertise-peer-urls=http://etcd:2380
+      --initial-cluster s1=http://etcd:2380
+      --initial-cluster-token etcd-cluster
+      --initial-cluster-state new
+    environment:
+      - ETCDCTL_API=3
+    volumes:
+      - etcd_data:/etcd-data
+    networks:
+      - ai-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # ================== MinIO ==================
+  minio:
+    image: minio/minio:RELEASE.2024-05-10T01-41-38Z
+    pull_policy: always
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - ai-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSL http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ================== Milvus ==================
+  milvus:
+    image: milvusdb/milvus:v2.4.4
+    pull_policy: always
+    container_name: milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY_ID=minioadmin
+      - MINIO_SECRET_ACCESS_KEY=minioadmin
+      - MINIO_USE_SSL=false
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    networks:
+      - ai-net
+    depends_on:
+      etcd:  { condition: service_healthy }
+      minio: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSL http://127.0.0.1:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  # ================== Attu (UI for Milvus) ==================
+  attu:
+    image: zilliz/attu:latest
+    pull_policy: always
+    container_name: attu
+    environment:
+      - MILVUS_URL=milvus:19530
+    ports:
+      - "3000:3000"
+    networks:
+      - ai-net
+    depends_on:
+      - milvus
+    restart: unless-stopped
+
+  # ================== OLLAMA (GPU) ==================
+  ollama:
+    image: ollama/ollama:0.12.0        # pin version đủ mới cho gpt-oss
+    pull_policy: always                 # ép compose luôn kéo image mới
+    container_name: ollama
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - OLLAMA_KEEP_ALIVE=4h
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_FLASH_ATTENTION=1
+    ports:
+      - "11434:11434"
+    networks:
+      - ai-net
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    restart: unless-stopped
+
+  # --------- INIT JOB: auto-pull gpt-oss:20b ----------
+  ollama-init:
+    image: ollama/ollama:0.11.0
+    pull_policy: always
+    container_name: ollama-init
+    depends_on:
+      ollama: { condition: service_healthy }   # chỉ chạy khi Ollama healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh","-lc","
+      set -e
+      echo 'waiting for ollama...'
+      # dùng CLI có sẵn thay vì curl (image ollama không ship curl)
+      for i in $(seq 1 120); do
+        if ollama list >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+      done
+      # retry kéo model cho chắc
+      for i in 1 2 3 4 5; do
+        if ollama pull gpt-oss:20b; then
+          echo 'model pulled successfully'
+          exit 0
+        fi
+        echo 'pull failed, retrying in 20s...'; sleep 20
+      done
+      echo 'pull failed after retries'; exit 1
+    "]
+    networks:
+      - ai-net
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: "no"
+
+  # ================== DOCUMENT / INGEST API (GPU) ==================
+  document-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: du-an-ai:latest
+    pull_policy: never
+    container_name: document-api
+    working_dir: /app/Embedding_vectorDB
+    gpus: all
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=0
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./uploads:/app/uploads
+      - ./models:/app/models
+    ports:
+      - "8000:8000"
+    networks:
+      - ai-net
+    depends_on:
+      milvus: { condition: service_healthy }
+      minio:  { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',8000))==0 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+    restart: unless-stopped
+
+  # ================== RAG CORE API ==================
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: du-an-ai:latest
+    pull_policy: never
+    container_name: rag-api
+    working_dir: /app/RAG_Core
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_HOST=http://ollama:11434
+      - LLM_MODEL=gpt-oss:20b
+      - NO_PROXY=ollama,localhost,127.0.0.1
+      - no_proxy=ollama,localhost,127.0.0.1
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8501"]
+    ports:
+      - "8501:8501"
+    networks:
+      - ai-net
+    depends_on:
+      document-api: { condition: service_started }  # giữ nguyên logic của bạn
+      ollama:       { condition: service_healthy }  # đảm bảo API sẵn sàng
+      ollama-init:  { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',8501))==0 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 25s
+    restart: unless-stopped

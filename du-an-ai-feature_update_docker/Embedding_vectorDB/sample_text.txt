@@ -1,0 +1,16 @@
+
+# Quy trình xử lý hồ sơ
+
+## 1. Tiếp nhận hồ sơ
+Công dân nộp hồ sơ tại bộ phận tiếp nhận hoặc qua hệ thống trực tuyến.
+
+## 2. Kiểm tra hồ sơ
+- Kiểm tra tính đầy đủ của hồ sơ
+- Xác minh thông tin cá nhân
+- Đối chiếu với quy định hiện hành
+
+## 3. Xử lý hồ sơ
+Thời gian xử lý: 15 ngày làm việc kể từ ngày tiếp nhận hồ sơ hợp lệ.
+
+## 4. Trả kết quả
+Thông báo kết quả qua SMS, email hoặc công dân đến trực tiếp để nhận.
