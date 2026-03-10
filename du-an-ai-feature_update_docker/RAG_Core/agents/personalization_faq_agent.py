@@ -26,8 +26,7 @@ class PersonalizationFAQAgent:
         self.vector_threshold = 0.5
         self.rerank_threshold = 0.6
 
-        # Prompt với personalization tích hợp
-        self.personalized_prompt = """Bạn là trợ lý ảo Onetouch - chuyên gia đào tạo kỹ năng số cho người dân và doanh nghiệp.
+        self.personalized_prompt = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, chuyên tư vấn các gói bảo hiểm, sản phẩm và dịch vụ của Techcomlife.
 
 THÔNG TIN KHÁCH HÀNG:
 - Tên: {customer_name}
@@ -48,25 +47,25 @@ NHIỆM VỤ CỦA BẠN:
 
 2. **Trả lời dựa vào FAQ có rerank_score cao nhất**
    - Nếu không có FAQ phù hợp (tất cả score quá thấp), trả về "NOT_FOUND"
-   - Nếu có FAQ phù hợp, dùng nội dung đó để trả lời
+   - Nếu có FAQ phù hợp, dùng nội dung đó để tư vấn về sản phẩm/dịch vụ Techcomlife
 
 3. **Cá nhân hóa nội dung**:
-   - Liên kết với lĩnh vực/ngành nghề của khách hàng
-   - Đưa ra ví dụ phù hợp với context công ty/vai trò
-   - Điều chỉnh tone phù hợp với vị trí (lãnh đạo → chiến lược, nhân viên → thực hành)
+   - Liên kết với nhu cầu bảo hiểm phù hợp lĩnh vực/ngành nghề của khách hàng
+   - Đưa ra ví dụ quyền lợi bảo hiểm phù hợp với vai trò và độ tuổi
+   - Điều chỉnh tone phù hợp với vị trí (lãnh đạo → tư vấn chiến lược bảo hiểm, nhân viên → hướng dẫn chi tiết)
 
 4. **Tone phù hợp**:
-   - Lãnh đạo cấp cao: Tôn trọng, tư vấn chiến lược
-   - Quản lý: Chuyên nghiệp, giải pháp cụ thể
-   - Nhân viên: Thân thiện, hướng dẫn chi tiết
+   - Lãnh đạo cấp cao: Tôn trọng, tư vấn giải pháp bảo hiểm toàn diện
+   - Quản lý: Chuyên nghiệp, giải pháp bảo hiểm cụ thể, thực tế
+   - Nhân viên/Cá nhân: Thân thiện, hướng dẫn chi tiết về quyền lợi
 
-5. **Kết thúc**: Câu hỏi mở để tiếp tục hỗ trợ
+5. **Kết thúc**: Câu hỏi mở để tiếp tục hỗ trợ về bảo hiểm Techcomlife
 
 YÊU CẦU QUAN TRỌNG:
 - BẮT ĐẦU bằng lời xưng hô phù hợp
 - Trả lời bằng tiếng Việt tự nhiên, thân thiện
-- KHÔNG nói "Dựa vào FAQ..." - trả lời như bạn biết
-- Giữ nguyên thông tin chính xác từ FAQ
+- KHÔNG nói "Dựa vào FAQ..." - trả lời như chuyên viên Techcomlife
+- Giữ nguyên thông tin chính xác về sản phẩm, quyền lợi bảo hiểm từ FAQ
 
 Hãy trả lời:"""
 
@@ -110,6 +109,10 @@ Hãy trả lời:"""
                 industry = "Truyền thông & Marketing"
             elif any(x in intro_lower for x in ["sản xuất", "manufacturing"]):
                 industry = "Sản xuất"
+            elif any(x in intro_lower for x in ["ngân hàng", "tài chính", "finance", "banking"]):
+                industry = "Ngân hàng & Tài chính"
+            elif any(x in intro_lower for x in ["y tế", "bệnh viện", "healthcare"]):
+                industry = "Y tế & Sức khỏe"
             else:
                 industry = "Không xác định"
 
@@ -143,17 +146,14 @@ Hãy trả lời:"""
             logger.info(f"📝 Question: '{question[:100]}'")
             logger.info(f"👤 Customer: {customer_name}")
 
-            # ✅ IMPORT PERSONALIZATION TOOLS
             from tools.vector_search import search_personalization_faq, rerank_faq
 
-            # Vector search trong PERSONALIZATION DB
             faq_results = search_personalization_faq.invoke({"query": question})
 
             if not faq_results or "error" in str(faq_results):
                 logger.warning("❌ Personalization vector search failed")
                 return self._route_to_retriever("Personalization vector search failed")
 
-            # Filter by threshold
             filtered_faqs = [
                 faq for faq in faq_results
                 if faq.get("similarity_score", 0) >= self.vector_threshold
@@ -165,7 +165,6 @@ Hãy trả lời:"""
 
             logger.info(f"✅ Found {len(filtered_faqs)} FAQs above threshold (personalization DB)")
 
-            # Rerank (using standard Cohere reranker)
             logger.info(f"🎯 Reranking with Cohere")
             reranked_faqs = rerank_faq.invoke({
                 "query": question,
@@ -181,21 +180,17 @@ Hãy trả lời:"""
 
             logger.info(f"📊 Best FAQ rerank score: {rerank_score:.3f}")
 
-            # Check confidence
             if rerank_score < self.rerank_threshold:
                 logger.info(f"⚠️  Not confident: {rerank_score:.3f} < {self.rerank_threshold}")
                 return self._route_to_retriever(f"Rerank score too low: {rerank_score:.3f}")
 
-            # Analyze customer profile
             customer_analysis = self._analyze_customer_profile(
                 customer_name,
                 customer_introduction
             )
 
-            # Format FAQ results
             faq_text = self._format_reranked_faq(reranked_faqs[:3])
 
-            # Create personalized prompt
             prompt = self.personalized_prompt.format(
                 customer_name=customer_name or "Quý khách",
                 customer_introduction=customer_introduction or "Không có thông tin",
@@ -204,7 +199,6 @@ Hãy trả lời:"""
                 faq_results=faq_text
             )
 
-            # Generate personalized answer
             logger.info(f"🤖 Generating personalized FAQ answer")
             response = llm_model.invoke(prompt)
 
@@ -253,7 +247,6 @@ Hãy trả lời:"""
     ) -> AsyncIterator[str]:
         """
         Streaming với personalization
-        NOTE: reranked_faqs should come from personalization DB
         """
         try:
             logger.info("🎭 Personalization FAQ streaming (personalization DB)")
@@ -263,16 +256,13 @@ Hãy trả lời:"""
                 yield "Không tìm thấy câu trả lời phù hợp."
                 return
 
-            # Analyze customer
             customer_analysis = self._analyze_customer_profile(
                 customer_name,
                 customer_introduction
             )
 
-            # Format FAQs
             faq_text = self._format_reranked_faq(reranked_faqs[:3])
 
-            # Create prompt
             prompt = self.personalized_prompt.format(
                 customer_name=customer_name or "Quý khách",
                 customer_introduction=customer_introduction or "Không có thông tin",
@@ -283,7 +273,6 @@ Hãy trả lời:"""
 
             logger.info("🚀 Streaming personalized FAQ answer...")
 
-            # Stream from LLM
             chunk_count = 0
             async for chunk in llm_model.astream(prompt):
                 if chunk:

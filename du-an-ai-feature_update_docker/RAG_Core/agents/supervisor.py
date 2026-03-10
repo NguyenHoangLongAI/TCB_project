@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class SupervisorAgent:
     def __init__(self):
         self.name = "SUPERVISOR"
-        self.classification_prompt = """Bạn là chuyên viên đào tạo kỹ năng chuyển đổi số, kiến thức sử dụng công nghệ thông tin cơ bản cho người dân - người điều phối chính của hệ thống chatbot.
+        self.classification_prompt = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - người điều phối chính của hệ thống chatbot tư vấn bảo hiểm và dịch vụ Techcomlife.
 
         Nhiệm vụ:
         1. Dựa vào lịch sử hội thoại và câu hỏi hiện tại, hãy xác định ngữ cảnh (context) mà người dùng đang đề cập đến.
@@ -21,13 +21,15 @@ class SupervisorAgent:
         3. Phân loại câu hỏi và chọn agent phù hợp để xử lý.
 
         Các agent có thể chọn:
-        - FAQ: 
-            - Dùng cho chào hỏi thân thiện, câu hỏi thường gặp. 
-            - Các yêu cầu liên quan đến đào tạo kỹ năng chuyển đổi số cho người dân và doanh nghiệp.
-            - Kiến thức về AI, CNTT.
-            - An toàn giao thông tin, bảo mật.
-            - Luật liên quan đến chuyển đổi số.
-        - OTHER: Câu hỏi hoặc yêu cầu nằm ngoài phạm vi chuyển đổi số.
+        - FAQ:
+            - Dùng cho chào hỏi thân thiện, câu hỏi thường gặp.
+            - Các câu hỏi liên quan đến sản phẩm và gói bảo hiểm của Techcomlife.
+            - Tư vấn quyền lợi bảo hiểm nhân thọ, bảo hiểm sức khỏe, bảo hiểm tai nạn.
+            - Thông tin về phí bảo hiểm, điều kiện tham gia, thủ tục bồi thường.
+            - Quy trình, quy định nội bộ tại Techcomlife.
+            - Thông tin về hợp đồng bảo hiểm, điều khoản, phụ lục.
+            - Các dịch vụ hỗ trợ khách hàng của Techcomlife.
+        - OTHER: Câu hỏi hoặc yêu cầu nằm ngoài phạm vi tư vấn bảo hiểm và dịch vụ Techcomlife.
         - CHATTER: Người dùng có dấu hiệu không hài lòng, giận dữ, hoặc cần được an ủi, làm dịu.
         - REPORTER: Khi người dùng phản ánh lỗi, mất kết nối, hoặc vấn đề kỹ thuật của hệ thống.
 
@@ -42,8 +44,8 @@ class SupervisorAgent:
              "thành phần thứ X", "phần này", "nó", "ý trên", "cái đó", "OK","có", "chi tiết","hãy hướng dẫn", "tiếp tục" ...
             - Nếu lịch sử có DANH SÁCH ĐÁNH SỐ → ánh xạ theo ĐÚNG THỨ TỰ.
             - Nếu có yêu cầu hành động không cụ thể ("OK","có", "chi tiết","hãy hướng dẫn", "tiếp tục"...) → dựa vào lịch sử hội thoại làm rõ yêu cầu
-            - Viết lại câu hỏi (contextualized_question) bằng TIẾNG VIỆT ĐẦY ĐỦ – RÕ NGHĨA – CÓ NGỮ CẢNH. 
-            -Đảm bảo câu hỏi được làm rõ (contextualized_question) phải có:
+            - Viết lại câu hỏi (contextualized_question) bằng TIẾNG VIỆT ĐẦY ĐỦ – RÕ NGHĨA – CÓ NGỮ CẢNH.
+            - Đảm bảo câu hỏi được làm rõ (contextualized_question) phải có:
                 - ĐỐI TƯỢNG cụ thể là gì
                 - HÀNH ĐỘNG cụ thể là gì
                 - Trong NGỮ CẢNH cụ thể là gì
@@ -73,7 +75,6 @@ class SupervisorAgent:
             logger.info("-" * 50)
             logger.info(f"📝 Question: '{question}'")
             logger.info(f"📚 History Length: {len(history) if history else 0} messages")
-
 
             # Format lịch sử
             history_text = self._format_history(history or [])

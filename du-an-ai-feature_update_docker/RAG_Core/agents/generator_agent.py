@@ -11,12 +11,11 @@ class GeneratorAgent:
     def __init__(self):
         self.name = "GENERATOR"
 
-        # Standard prompt (unchanged)
-        self.standard_prompt = """Bạn là một chuyên viên tư vấn khách hàng người Việt Nam thân thiện và chuyên nghiệp.
+        self.standard_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 Câu hỏi của khách hàng: "{question}"
 
-Thông tin tham khảo từ tài liệu:
+Thông tin tham khảo từ tài liệu Techcomlife:
 {documents}
 
 Lịch sử trò chuyện gần đây:
@@ -25,13 +24,13 @@ Lịch sử trò chuyện gần đây:
 Yêu cầu trả lời:
 - Trả lời bằng giọng văn tự nhiên như người Việt Nam nói chuyện
 - Trả lời thẳng vào vấn đề, ngắn gọn súc tích
-- Dựa vào thông tin tài liệu nhưng diễn đạt theo cách hiểu của bạn
+- Dựa vào thông tin tài liệu Techcomlife nhưng diễn đạt theo cách hiểu của bạn
+- Đảm bảo thông tin về quyền lợi bảo hiểm, phí, thủ tục được trình bày rõ ràng, chính xác
 - Kết thúc bằng câu hỏi ngắn để tiếp tục hỗ trợ nếu cần
 
-Hãy trả lời như đang nói chuyện trực tiếp với khách hàng:"""
+Hãy trả lời như đang tư vấn trực tiếp với khách hàng:"""
 
-        # Follow-up prompt (unchanged)
-        self.followup_prompt = """Bạn là một chuyên viên tư vấn khách hàng người Việt Nam thân thiện và chuyên nghiệp.
+        self.followup_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 🔍 NGỮ CẢNH CUỘC TRÒ CHUYỆN:
 {context_summary}
@@ -41,7 +40,7 @@ Hãy trả lời như đang nói chuyện trực tiếp với khách hàng:"""
 
 ❓ CÂU HỎI FOLLOW-UP CỦA KHÁCH HÀNG: "{question}"
 
-📚 THÔNG TIN TÀI LIỆU LIÊN QUAN:
+📚 THÔNG TIN TÀI LIỆU TECHCOMLIFE LIÊN QUAN:
 {documents}
 
 ⚠️ YÊU CẦU ĐẶC BIỆT cho follow-up question:
@@ -53,6 +52,7 @@ Hãy trả lời như đang nói chuyện trực tiếp với khách hàng:"""
 📋 YÊU CẦU CHUNG:
 - Trả lời bằng giọng văn tự nhiên như người Việt Nam nói chuyện
 - Ngắn gọn, súc tích, đúng trọng tâm
+- Đảm bảo thông tin bảo hiểm chính xác theo tài liệu Techcomlife
 - Kết thúc bằng câu hỏi để tiếp tục hỗ trợ nếu cần
 
 Hãy trả lời:"""
@@ -91,7 +91,6 @@ Hãy trả lời:"""
         if not history:
             return "Không có lịch sử"
 
-        # Normalize history
         normalized_history = []
         for msg in history:
             if isinstance(msg, dict):
@@ -105,13 +104,12 @@ Hãy trả lời:"""
                     "content": getattr(msg, "content", "")
                 })
 
-        # Lấy N turn gần nhất
         recent_history = normalized_history[-(max_turns * 2):] if len(
             normalized_history) > max_turns * 2 else normalized_history
 
         history_lines = []
         for msg in recent_history:
-            role = "👤 Khách hàng" if msg.get("role") == "user" else "🤖 Trợ lý"
+            role = "👤 Khách hàng" if msg.get("role") == "user" else "🤖 Trợ lý Techcomlife"
             content = msg.get("content", "")
             if content:
                 history_lines.append(f"{role}: {content}")
@@ -123,7 +121,6 @@ Hãy trả lời:"""
         if not history or len(history) < 2:
             return "Đây là câu hỏi đầu tiên"
 
-        # Normalize history
         normalized_history = []
         for msg in history:
             if isinstance(msg, dict):
@@ -134,7 +131,6 @@ Hãy trả lời:"""
                     "content": getattr(msg, "content", "")
                 })
 
-        # Lấy câu hỏi trước
         for i in range(len(normalized_history) - 1, -1, -1):
             if normalized_history[i].get("role") == "user":
                 prev_question = normalized_history[i].get("content", "")
@@ -171,7 +167,6 @@ Hãy trả lời:"""
             doc_text = self._format_documents(documents)
             history_text = self._format_history(history or [], max_turns=2)
 
-            # Chọn prompt
             if is_followup:
                 if not context_summary:
                     context_summary = self._extract_context_summary(history or [])
@@ -189,11 +184,10 @@ Hãy trả lời:"""
                     documents=doc_text
                 )
 
-            # Generate answer (non-streaming)
             answer = llm_model.invoke(prompt)
 
             if not answer or len(answer.strip()) < 10:
-                answer = "Tôi đã tìm thấy thông tin liên quan nhưng gặp khó khăn trong việc tạo câu trả lời."
+                answer = "Tôi đã tìm thấy thông tin liên quan nhưng gặp khó khăn trong việc tạo câu trả lời. Vui lòng liên hệ hotline Techcomlife để được hỗ trợ trực tiếp."
 
             unique_references = self._deduplicate_references(references or [])
 
@@ -225,8 +219,6 @@ Hãy trả lời:"""
     ) -> AsyncIterator[str]:
         """
         FIXED: Streaming generation with proper async/await
-
-        Returns async generator that yields text chunks
         """
         try:
             logger.info(f"🚀 Generator: Starting streaming for: {question[:50]}...")
@@ -235,11 +227,9 @@ Hãy trả lời:"""
                 yield "Không có tài liệu để tạo câu trả lời."
                 return
 
-            # Format inputs
             doc_text = self._format_documents(documents)
             history_text = self._format_history(history or [], max_turns=2)
 
-            # Choose prompt
             if is_followup:
                 if not context_summary:
                     context_summary = self._extract_context_summary(history or [])
@@ -259,10 +249,9 @@ Hãy trả lời:"""
 
             logger.info(f"📝 Generator: Prompt prepared, length={len(prompt)}")
 
-            # CRITICAL: Stream from LLM
             chunk_count = 0
             async for chunk in llm_model.astream(prompt):
-                if chunk:  # Only yield non-empty chunks
+                if chunk:
                     chunk_count += 1
                     logger.debug(f"Generator yielding chunk #{chunk_count}: {chunk[:30]}...")
                     yield chunk

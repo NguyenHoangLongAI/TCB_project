@@ -22,15 +22,14 @@ class PersonalizationNotEnoughInfoAgent:
     def __init__(self):
         self.name = "PERSONALIZATION_NOT_ENOUGH_INFO"
 
-        # Personalized prompt
-        self.personalized_prompt = """Bạn là trợ lý ảo Onetouch - chuyên gia đào tạo kỹ năng số cho người dân và doanh nghiệp.
+        self.personalized_prompt = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, chuyên tư vấn các gói bảo hiểm, sản phẩm và dịch vụ của Techcomlife.
 
 THÔNG TIN KHÁCH HÀNG:
 - Tên: {customer_name}
 - Giới thiệu: {customer_introduction}
 - Phân tích: {customer_analysis}
 
-TÌNH HUỐNG: Không có đủ dữ liệu trong hệ thống để trả lời chính xác câu hỏi này.
+TÌNH HUỐNG: Không có đủ dữ liệu trong hệ thống Techcomlife để trả lời chính xác câu hỏi này.
 
 CÂU HỎI CỦA KHÁCH HÀNG: "{question}"
 
@@ -45,39 +44,39 @@ YÊU CẦU TRẢ LỜI:
 2. **Cấu trúc câu trả lời** (BẮT BUỘC NGẮN GỌN):
 
     a) MỞ ĐẦU (1 câu và KẾT THÚC BẰNG XUỐNG DÒNG):
-    "Thưa Anh/Chị {customer_name}, dựa trên tổng hợp từ các nguồn thông tin, bạn có thể tham khảo như sau:\n"
+    "Thưa Anh/Chị {customer_name}, dựa trên tổng hợp từ các nguồn thông tin về bảo hiểm, bạn có thể tham khảo như sau:\n"
 
     b) NỘI DUNG CHÍNH:
     - Viết thành một đoạn riêng biệt.
     - KHÔNG nối liền với câu mở đầu.
     - KHÔNG gộp chung thành một dòng.
     - KHÔNG phân tích dài dòng.
+    - Cung cấp thông tin tham khảo chung về bảo hiểm nhân thọ hoặc chủ đề liên quan
 
     c) XUỐNG DÒNG và KẾT THÚC:
-    "\nViệc lựa chọn giải pháp ứng dụng AI cần căn cứ vào thực tế hoạt động của từng Phòng/Ban, năng lực đội ngũ và yêu cầu bảo mật dữ liệu của đơn vị. Trợ lý học tập có thể hỗ trợ phân tích, giải thích chi tiết các nội dung còn vướng mắc trong quá trình học tập; đồng thời sẽ tư vấn chuyên sâu, sát thực tiễn hơn khi được cung cấp và nghiên cứu đầy đủ tài liệu, quy trình và dữ liệu liên quan của Phòng/Ban."
+    "\nĐể được tư vấn chính xác về sản phẩm và quyền lợi bảo hiểm phù hợp với nhu cầu cụ thể của Anh/Chị, Techcomlife rất mong được hỗ trợ trực tiếp qua hotline."
 
 3. **Cá nhân hóa nội dung**:
-   - Nếu biết lĩnh vực: Đưa ví dụ phù hợp (công nghệ, truyền thông, sản xuất...)
-   - Điều chỉnh độ kỹ thuật theo vị trí:
-     * Lãnh đạo → Tổng quan, chiến lược
-     * Quản lý → Giải pháp thực tế
-     * Nhân viên → Dễ hiểu, ứng dụng
+   - Nếu biết lĩnh vực: Đề cập đến nhu cầu bảo hiểm phù hợp với ngành (công nghệ, tài chính, sản xuất...)
+   - Điều chỉnh theo vị trí:
+     * Lãnh đạo → Giải pháp bảo hiểm toàn diện, bảo vệ tài sản
+     * Quản lý → Bảo hiểm sức khỏe, tai nạn, thu nhập
+     * Nhân viên/Cá nhân → Quyền lợi cơ bản, thủ tục đơn giản
 
 4. **Tone phù hợp**:
    - Lãnh đạo cấp cao: Tôn trọng, chuyên nghiệp
    - Quản lý: Thân thiện, hỗ trợ
-   - Nhân viên: Gần gũi, dễ tiếp cận
+   - Nhân viên/Cá nhân: Gần gũi, dễ tiếp cận
 
 5. **QUY TẮC VỀ ĐƯỜNG LINK - BẮT BUỘC TUÂN THỦ**:
    - TUYỆT ĐỐI KHÔNG tự bịa đặt hoặc suy đoán bất kỳ đường link/URL nào.
    - CHỈ được cung cấp link nếu link đó được cung cấp rõ ràng trong dữ liệu hệ thống.
-   - Nếu khách hàng hỏi về đường link mà hệ thống KHÔNG có: trả lời rằng hiện tại bạn không có thông tin về đường link này và xin lỗi vì chưa thể hỗ trợ được yêu cầu này.
-   - Nếu có link hợp lệ từ hệ thống: trình bày dưới dạng Markdown để có thể click được, ví dụ: [Tên trang](https://example.com)
+   - Nếu khách hàng hỏi về đường link mà hệ thống KHÔNG có: thông báo không có thông tin và đề nghị liên hệ hotline Techcomlife.
 
 6. **YÊU CẦU ĐẶC BIỆT**:
    - NGẮN GỌN (tối đa 3-4 câu)
    - KHÔNG kể ví dụ dài
-   - KHÔNG giải thích chi tiết
+   - KHÔNG giải thích chi tiết điều khoản hợp đồng
    - BẮT ĐẦU bằng lời xưng hô phù hợp
 
 Hãy trả lời:"""
@@ -93,7 +92,6 @@ Hãy trả lời:"""
         try:
             intro_lower = (customer_introduction or "").lower()
 
-            # Detect title
             if any(x in intro_lower for x in ["tổng giám đốc", "tổng gd", "ceo"]):
                 title = "Tổng giám đốc"
                 seniority = "C-level"
@@ -115,13 +113,16 @@ Hãy trả lời:"""
                 seniority = "Individual"
                 tone = "professional"
 
-            # Detect industry
             if any(x in intro_lower for x in ["công nghệ", "technology", "tech", "cntt"]):
                 industry = "Công nghệ thông tin"
             elif any(x in intro_lower for x in ["truyền thông", "media", "marketing"]):
                 industry = "Truyền thông & Marketing"
             elif any(x in intro_lower for x in ["sản xuất", "manufacturing"]):
                 industry = "Sản xuất"
+            elif any(x in intro_lower for x in ["ngân hàng", "tài chính", "finance", "banking"]):
+                industry = "Ngân hàng & Tài chính"
+            elif any(x in intro_lower for x in ["y tế", "bệnh viện", "healthcare"]):
+                industry = "Y tế & Sức khỏe"
             else:
                 industry = "Không xác định"
 
@@ -156,20 +157,18 @@ Hãy trả lời:"""
     def _fallback_message(self, customer_name: str) -> str:
         """
         Trả về fallback message chuẩn.
-        - Không bịa link, không đề cập hotline.
-        - Chỉ thêm link nếu settings.SUPPORT_URL tồn tại.
         """
-        greeting = f"Thưa Anh/Chị {customer_name}" if customer_name else "Xin chào"
+        greeting = f"Thưa Anh/Chị {customer_name}" if customer_name else "Xin chào Quý khách"
 
         support_url_part = ""
         if getattr(settings, "SUPPORT_URL", None):
-            support_url_part = f"\n\nBạn có thể tham khảo thêm tại [Trang hỗ trợ]({settings.SUPPORT_URL})."
+            support_url_part = f"\n\nBạn có thể tham khảo thêm tại [Trang Techcomlife]({settings.SUPPORT_URL})."
 
         return (
             f"{greeting},\n\n"
-            f"Xin lỗi, hệ thống gặp lỗi khi xử lý câu hỏi của bạn."
+            f"Xin lỗi, hệ thống Techcomlife gặp lỗi khi xử lý câu hỏi của bạn."
             f"{support_url_part}\n\n"
-            f"Cảm ơn bạn!"
+            f"Vui lòng liên hệ hotline Techcomlife {settings.SUPPORT_PHONE} để được hỗ trợ trực tiếp. Cảm ơn bạn!"
         )
 
     def process(
@@ -181,11 +180,6 @@ Hãy trả lời:"""
     ) -> Dict[str, Any]:
         """
         Non-streaming process với personalization
-
-        Args:
-            question: Câu hỏi
-            customer_name: Tên khách hàng
-            customer_introduction: Giới thiệu về khách hàng
         """
         try:
             logger.info("🎭 Personalized Not Enough Info (non-streaming)")
@@ -240,11 +234,6 @@ Hãy trả lời:"""
     ) -> AsyncIterator[str]:
         """
         Streaming process với personalization
-
-        Args:
-            question: Câu hỏi
-            customer_name: Tên khách hàng
-            customer_introduction: Giới thiệu về khách hàng
         """
         try:
             logger.info("🎭 Personalized Not Enough Info streaming")

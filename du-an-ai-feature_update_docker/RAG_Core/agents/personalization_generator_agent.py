@@ -20,8 +20,7 @@ class PersonalizationGeneratorAgent:
     def __init__(self):
         self.name = "PERSONALIZATION_GENERATOR"
 
-        # Standard prompt với personalization
-        self.personalized_standard_prompt = """Bạn là trợ lý ảo Onetouch - chuyên gia đào tạo kỹ năng số cho người dân và doanh nghiệp.
+        self.personalized_standard_prompt = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, chuyên tư vấn các gói bảo hiểm, sản phẩm và dịch vụ của Techcomlife.
 
 THÔNG TIN KHÁCH HÀNG:
 - Tên: {customer_name}
@@ -30,7 +29,7 @@ THÔNG TIN KHÁCH HÀNG:
 
 CÂU HỎI CỦA KHÁCH HÀNG: "{question}"
 
-THÔNG TIN TÀI LIỆU THAM KHẢO:
+THÔNG TIN TÀI LIỆU TECHCOMLIFE THAM KHẢO:
 {documents}
 
 LỊCH SỬ HỘI THOẠI GẦN NHẤT:
@@ -45,22 +44,23 @@ YÊU CẦU TRẢ LỜI:
    - Nếu không rõ: "Anh/Chị {customer_name}"
 
 2. **Cá nhân hóa nội dung**:
-   - Liên kết câu trả lời với lĩnh vực/ngành nghề của khách hàng
-   - Đưa ra ví dụ phù hợp với context công ty/vai trò
+   - Liên kết câu trả lời với nhu cầu bảo hiểm phù hợp lĩnh vực/ngành nghề của khách hàng
+   - Đưa ra ví dụ về quyền lợi bảo hiểm phù hợp với vai trò và bối cảnh
    - Điều chỉnh độ chuyên sâu dựa trên vị trí:
-     * Lãnh đạo → Tổng quan chiến lược, tầm nhìn
-     * Quản lý → Giải pháp cụ thể, thực tiễn
-     * Nhân viên → Chi tiết thực hành, dễ hiểu
+     * Lãnh đạo → Tổng quan giải pháp bảo hiểm toàn diện, chiến lược bảo vệ tài sản
+     * Quản lý → Giải pháp bảo hiểm cụ thể, thực tiễn
+     * Nhân viên/Cá nhân → Hướng dẫn chi tiết về quyền lợi, thủ tục
 
 3. **Tone phù hợp**:
-   - Lãnh đạo cấp cao: Tôn trọng, tư vấn chiến lược
+   - Lãnh đạo cấp cao: Tôn trọng, tư vấn chiến lược bảo hiểm
    - Quản lý: Chuyên nghiệp, giải pháp cụ thể
-   - Nhân viên: Thân thiện, hướng dẫn chi tiết
+   - Nhân viên/Cá nhân: Thân thiện, hướng dẫn chi tiết
 
 4. **Nội dung**:
    - Trả lời bằng giọng văn tự nhiên như người Việt Nam nói chuyện
    - Trả lời thẳng vào vấn đề, ngắn gọn súc tích
-   - Dựa vào thông tin tài liệu nhưng diễn đạt theo cách hiểu của bạn
+   - Dựa vào thông tin tài liệu Techcomlife nhưng diễn đạt theo cách hiểu của bạn
+   - Đảm bảo thông tin về quyền lợi, phí bảo hiểm, thủ tục được trình bày rõ ràng
    - Kết thúc bằng câu hỏi ngắn để tiếp tục hỗ trợ nếu cần
 
 5. **Định dạng**:
@@ -68,10 +68,9 @@ YÊU CẦU TRẢ LỜI:
    - Nội dung chính với personalization
    - KẾT THÚC bằng câu hỏi mở
 
-Hãy trả lời như đang nói chuyện trực tiếp với khách hàng:"""
+Hãy trả lời như đang tư vấn trực tiếp với khách hàng:"""
 
-        # Follow-up prompt với personalization
-        self.personalized_followup_prompt = """Bạn là trợ lý ảo Onetouch - chuyên gia đào tạo kỹ năng số cho người dân và doanh nghiệp.
+        self.personalized_followup_prompt = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, chuyên tư vấn các gói bảo hiểm, sản phẩm và dịch vụ của Techcomlife.
 
 THÔNG TIN KHÁCH HÀNG:
 - Tên: {customer_name}
@@ -86,7 +85,7 @@ LỊCH SỬ GẦN NHẤT:
 
 CÂU HỎI FOLLOW-UP: "{question}"
 
-THÔNG TIN TÀI LIỆU LIÊN QUAN:
+THÔNG TIN TÀI LIỆU TECHCOMLIFE LIÊN QUAN:
 {documents}
 
 YÊU CẦU ĐẶC BIỆT CHO FOLLOW-UP:
@@ -94,7 +93,7 @@ YÊU CẦU ĐẶC BIỆT CHO FOLLOW-UP:
 1. **Xưng hô nhất quán** với câu trả lời trước (Thưa Anh/Chị {customer_name})
 
 2. **Tham chiếu tự nhiên**:
-   - Nhận biết rằng khách hàng đang hỏi tiếp về chủ đề đã thảo luận
+   - Nhận biết rằng khách hàng đang hỏi tiếp về chủ đề bảo hiểm đã thảo luận
    - Tham chiếu đến thông tin đã cung cấp trước đó
    - Trả lời cụ thể vào phần mà khách hàng muốn biết thêm
 
@@ -102,10 +101,11 @@ YÊU CẦU ĐẶC BIỆT CHO FOLLOW-UP:
 
 4. **Cá nhân hóa tiếp tục**:
    - Duy trì tone phù hợp với vị trí khách hàng
-   - Liên kết với ngành nghề/lĩnh vực của họ
+   - Liên kết với ngành nghề/lĩnh vực của họ khi cần thiết
 
 5. **Nội dung**:
    - Trả lời ngắn gọn, đúng trọng tâm
+   - Đảm bảo thông tin bảo hiểm chính xác theo tài liệu Techcomlife
    - Kết thúc bằng câu hỏi để tiếp tục hỗ trợ
 
 Hãy trả lời:"""
@@ -121,7 +121,6 @@ Hãy trả lời:"""
         try:
             intro_lower = (customer_introduction or "").lower()
 
-            # Detect title
             if any(x in intro_lower for x in ["tổng giám đốc", "tổng gd", "ceo"]):
                 title = "Tổng giám đốc"
                 seniority = "C-level"
@@ -143,13 +142,16 @@ Hãy trả lời:"""
                 seniority = "Individual"
                 tone = "professional"
 
-            # Detect industry
             if any(x in intro_lower for x in ["công nghệ", "technology", "tech", "cntt"]):
                 industry = "Công nghệ thông tin"
             elif any(x in intro_lower for x in ["truyền thông", "media", "marketing"]):
                 industry = "Truyền thông & Marketing"
             elif any(x in intro_lower for x in ["sản xuất", "manufacturing"]):
                 industry = "Sản xuất"
+            elif any(x in intro_lower for x in ["ngân hàng", "tài chính", "finance", "banking"]):
+                industry = "Ngân hàng & Tài chính"
+            elif any(x in intro_lower for x in ["y tế", "bệnh viện", "healthcare"]):
+                industry = "Y tế & Sức khỏe"
             else:
                 industry = "Không xác định"
 
@@ -199,7 +201,7 @@ Hãy trả lời:"""
 
         history_lines = []
         for msg in recent:
-            role = "👤 Khách hàng" if msg.get("role") == "user" else "🤖 Trợ lý"
+            role = "👤 Khách hàng" if msg.get("role") == "user" else "🤖 Trợ lý Techcomlife"
             content = msg.get("content", "")
             if content:
                 history_lines.append(f"{role}: {content}")
@@ -262,17 +264,14 @@ Hãy trả lời:"""
                     "next_agent": "end"
                 }
 
-            # Analyze customer
             customer_analysis = self._analyze_customer_profile(
                 customer_name,
                 customer_introduction
             )
 
-            # Format inputs
             doc_text = self._format_documents(documents)
             history_text = self._format_history(history or [], max_turns=2)
 
-            # Choose prompt
             if is_followup:
                 if not context_summary:
                     context_summary = self._extract_context_summary(history or [])
@@ -296,11 +295,10 @@ Hãy trả lời:"""
                     documents=doc_text
                 )
 
-            # Generate answer
             answer = llm_model.invoke(prompt)
 
             if not answer or len(answer.strip()) < 10:
-                answer = "Tôi đã tìm thấy thông tin liên quan nhưng gặp khó khăn trong việc tạo câu trả lời."
+                answer = "Tôi đã tìm thấy thông tin liên quan nhưng gặp khó khăn trong việc tạo câu trả lời. Vui lòng liên hệ hotline Techcomlife để được hỗ trợ trực tiếp."
 
             logger.info("✅ Personalized answer generated")
 
@@ -346,17 +344,14 @@ Hãy trả lời:"""
                 yield "Không có tài liệu để tạo câu trả lời."
                 return
 
-            # Analyze customer
             customer_analysis = self._analyze_customer_profile(
                 customer_name,
                 customer_introduction
             )
 
-            # Format inputs
             doc_text = self._format_documents(documents)
             history_text = self._format_history(history or [], max_turns=2)
 
-            # Choose prompt
             if is_followup:
                 if not context_summary:
                     context_summary = self._extract_context_summary(history or [])
@@ -382,7 +377,6 @@ Hãy trả lời:"""
 
             logger.info("🚀 Streaming personalized answer...")
 
-            # Stream from LLM
             chunk_count = 0
             async for chunk in llm_model.astream(prompt):
                 if chunk:

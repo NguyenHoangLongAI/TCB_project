@@ -17,10 +17,7 @@ class FAQAgent:
         self.vector_threshold = 0.5
         self.rerank_threshold = 0.6
 
-        # REMOVED: direct_answer_threshold, force_similarity_threshold
-        # → Luôn dùng LLM
-
-        self.llm_prompt = """Bạn là một chuyên viên tư vấn khách hàng người Việt Nam thân thiện và chuyên nghiệp.
+        self.llm_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 Câu hỏi người dùng: "{question}"
 
@@ -31,9 +28,9 @@ Hướng dẫn:
 1. Kết quả đã được sắp xếp theo độ phù hợp (rerank_score)
 2. Hãy dựa vào FAQ có rerank_score cao nhất để trả lời
 3. Nếu không có FAQ nào phù hợp (tất cả score quá thấp), trả về "NOT_FOUND"
-4. Trả lời bằng tiếng Việt, thân thiện và chính xác
+4. Trả lời bằng tiếng Việt, thân thiện và chính xác theo thông tin sản phẩm, dịch vụ của Techcomlife
 5. Có thể kết hợp thông tin từ nhiều FAQ nếu cần
-6. Đừng nói "Dựa vào FAQ..." hay "Theo tài liệu..." - trả lời trực tiếp như bạn biết
+6. Đừng nói "Dựa vào FAQ..." hay "Theo tài liệu..." - trả lời trực tiếp như một chuyên viên Techcomlife
 
 Trả lời:"""
 
