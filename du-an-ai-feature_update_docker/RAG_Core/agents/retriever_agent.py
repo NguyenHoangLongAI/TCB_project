@@ -1,8 +1,7 @@
-# RAG_Core/agents/retriever_agent.py - FIXED: Use contextualized_question
+# RAG_Core/agents/retriever_agent.py  (UPDATED – ACL-aware via user_id)
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from models.llm_model import llm_model
-from tools.vector_search import search_documents
 from config.settings import settings
 import logging
 
@@ -11,60 +10,44 @@ logger = logging.getLogger(__name__)
 
 class RetrieverAgent:
     def __init__(self):
-        self.name = "RETRIEVER"
-        self.tools = [search_documents]
+        self.name  = "RETRIEVER"
 
     def process(
-            self,
-            question: str,
-            contextualized_question: str = "",  # NEW: Accept contextualized question
-            is_followup: bool = False,
-            **kwargs
+        self,
+        question:               str,
+        contextualized_question: str = "",
+        is_followup:            bool = False,
+        user_id:                Optional[str] = None,   # NEW
+        **kwargs,
     ) -> Dict[str, Any]:
         """
-        Tìm kiếm tài liệu liên quan đến câu hỏi
-
-        Args:
-            question: Câu hỏi gốc (for logging)
-            contextualized_question: Câu hỏi đã được làm rõ (dùng để search)
-            is_followup: Có phải follow-up question không
+        Search for relevant documents.
+        When user_id is provided, uses ACL-filtered search.
         """
         try:
-            # ================================================================
-            # QUYẾT ĐỊNH QUERY CHO VECTOR SEARCH
-            # ================================================================
-
-            # FIXED: Nếu là follow-up và có contextualized_question → dùng nó
+            # Decide which query to use
             if is_followup or contextualized_question:
-                search_query = contextualized_question
-                logger.info(f"🔍 Using CONTEXTUALIZED QUESTION for vector search (follow-up)")
-                logger.debug(f"Original: {question[:60]}")
-                logger.debug(f"Contextualized: {contextualized_question[:100]}")
+                search_query = contextualized_question or question
+                logger.info("🔍 Using CONTEXTUALIZED question for vector search")
             else:
-                # Không phải follow-up hoặc không có contextualized → dùng câu hỏi gốc
                 search_query = question
-                logger.info(f"🔍 Using ORIGINAL QUESTION for vector search")
+                logger.info("🔍 Using ORIGINAL question for vector search")
 
-            # ================================================================
-            # VECTOR SEARCH
-            # ================================================================
-
-            logger.info(f"📚 Searching documents with query: {search_query[:100]}...")
-
-            # Tìm kiếm tài liệu với query đã quyết định
-            search_results = search_documents.invoke({"query": search_query})
+            # ── ACL-aware search ────────────────────────────────────────────
+            if user_id:
+                from tools.vector_search import search_documents_for_user
+                logger.info(f"🔒 ACL-filtered search for user_id={user_id}")
+                search_results = search_documents_for_user.invoke({
+                    "query":   search_query,
+                    "user_id": user_id,
+                })
+            else:
+                from tools.vector_search import search_documents
+                logger.info("🔓 Open search (no user_id)")
+                search_results = search_documents.invoke({"query": search_query})
 
             if not search_results or "error" in str(search_results):
-                logger.warning("Vector search failed or returned error")
-                return {
-                    "status": "ERROR",
-                    "documents": [],
-                    "next_agent": "NOT_ENOUGH_INFO"
-                }
-
-            # ================================================================
-            # LỌC KẾT QUẢ THEO SIMILARITY THRESHOLD
-            # ================================================================
+                return {"status": "ERROR", "documents": [], "next_agent": "NOT_ENOUGH_INFO"}
 
             relevant_docs = [
                 doc for doc in search_results
@@ -72,33 +55,12 @@ class RetrieverAgent:
             ]
 
             if not relevant_docs:
-                logger.info(
-                    f"No documents above threshold {settings.SIMILARITY_THRESHOLD}, "
-                    f"returning all {len(search_results)} for grader"
-                )
-                return {
-                    "status": "NOT_FOUND",
-                    "documents": search_results,  # Pass all to GRADER for reranking
-                    "search_query_used": "contextualized" if (is_followup and contextualized_question) else "original",
-                    "next_agent": "GRADER"
-                }
+                logger.info(f"No docs above threshold {settings.SIMILARITY_THRESHOLD}, passing all to GRADER")
+                return {"status": "NOT_FOUND", "documents": search_results, "next_agent": "GRADER"}
 
-            logger.info(
-                f"✅ Found {len(relevant_docs)} relevant documents "
-                f"(searched with {'contextualized question' if is_followup and contextualized_question else 'original question'})"
-            )
-
-            return {
-                "status": "SUCCESS",
-                "documents": relevant_docs,
-                "search_query_used": "contextualized" if (is_followup and contextualized_question) else "original",
-                "next_agent": "GRADER"
-            }
+            logger.info(f"✅ Found {len(relevant_docs)} relevant documents")
+            return {"status": "SUCCESS", "documents": relevant_docs, "next_agent": "GRADER"}
 
         except Exception as e:
             logger.error(f"❌ Retriever error: {e}", exc_info=True)
-            return {
-                "status": "ERROR",
-                "documents": [],
-                "next_agent": "REPORTER"
-            }
+            return {"status": "ERROR", "documents": [], "next_agent": "REPORTER"}

@@ -1,4 +1,4 @@
-# RAG_Core/api/schemas.py - COMPLETE VERSION WITH URL FIELDS
+# RAG_Core/api/schemas.py  (UPDATED – user_id + token tracking)
 
 from pydantic import BaseModel
 from typing import List, Optional, Union, Literal
@@ -11,47 +11,36 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    history: Optional[Union[List[str], List[ChatMessage]]] = []
-    stream: Optional[bool] = False
+    history:  Optional[Union[List[str], List[ChatMessage]]] = []
+    stream:   Optional[bool] = False
+    user_id:  Optional[str]  = None    # NEW – required for ACL + token tracking
 
 
 class StreamChunk(BaseModel):
-    """Single chunk in streaming response"""
-    type: Literal["start", "chunk", "references", "end", "error"]
-    content: Optional[str] = None
-    references: Optional[List['DocumentReference']] = None
-    status: Optional[str] = None
+    type:       Literal["start", "chunk", "references", "end", "error"]
+    content:    Optional[str] = None
+    references: Optional[List["DocumentReference"]] = None
+    status:     Optional[str] = None
+    token_usage: Optional[dict] = None   # NEW
 
 
 class DocumentReference(BaseModel):
-    """
-    Document reference with optional URL information
-
-    Fields:
-    - document_id: Unique document identifier
-    - type: Reference type (FAQ, DOCUMENT, SUPPORT, SYSTEM)
-    - description: Document description/content preview
-    - url: Public URL to document (NEW)
-    - filename: Original filename (NEW)
-    - file_type: File extension like .pdf, .docx (NEW)
-    """
     document_id: str
-    type: str  # FAQ, DOCUMENT, SUPPORT, SYSTEM
+    type:        str
     description: Optional[str] = None
-
-    # ===== NEW FIELDS =====
-    url: Optional[str] = None  # https://ngrok.../file.pdf
-    filename: Optional[str] = None  # file.pdf
-    file_type: Optional[str] = None  # .pdf
+    url:         Optional[str] = None
+    filename:    Optional[str] = None
+    file_type:   Optional[str] = None
 
 
 class ChatResponse(BaseModel):
-    answer: str
-    references: List[DocumentReference]
-    status: str = "SUCCESS"
+    answer:      str
+    references:  List[DocumentReference]
+    status:      str = "SUCCESS"
+    token_usage: Optional[dict] = None   # NEW – total tokens used in this call
 
 
 class HealthResponse(BaseModel):
-    status: str
-    message: str
+    status:             str
+    message:            str
     database_connected: bool

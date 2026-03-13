@@ -1,19 +1,13 @@
+# Embedding_vectorDB/milvus_client.py  (UPDATED – user_groups + ACL)
 """
-Unified Milvus Manager for all collections:
-- document_embeddings: Document content embeddings
-- faq_embeddings: FAQ question/answer embeddings
-- document_urls: Document URLs with filename embeddings for search
+Unified Milvus Manager – adds user_groups collection and
+permission-aware document_embeddings (group/company/dept/user_id fields).
 """
 
 from pymilvus import (
-    connections,
-    Collection,
-    FieldSchema,
-    CollectionSchema,
-    DataType,
-    utility
+    connections, Collection, FieldSchema, CollectionSchema, DataType, utility
 )
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncio
 import logging
 import os
@@ -23,923 +17,473 @@ logger = logging.getLogger(__name__)
 
 
 class MilvusManager:
-    """Unified manager for all Milvus collections"""
 
-    def __init__(
-            self,
-            host: str = "localhost",
-            port: str = "19530",
-            embedding_dim: int = 768
-    ):
+    def __init__(self, host: str = "localhost", port: str = "19530", embedding_dim: int = 768):
         self.host = host
         self.port = port
         self.embedding_dim = embedding_dim
 
-        # Collection names
-        self.doc_collection_name = "document_embeddings"
-        self.faq_collection_name = "faq_embeddings"
-        self.url_collection_name = "document_urls"
+        self.doc_collection_name  = "document_embeddings"
+        self.faq_collection_name  = "faq_embeddings"
+        self.url_collection_name  = "document_urls"
+        self.ug_collection_name   = "user_groups"
 
-        # Collections
         self.doc_collection = None
         self.faq_collection = None
         self.url_collection = None
+        self.ug_collection  = None
 
-        # State
         self.is_initialized = False
 
-        # Field limits
-        self.max_id_length = 190
+        self.max_id_length          = 190
         self.max_document_id_length = 90
         self.max_description_length = 60000
-        self.max_question_length = 60000
-        self.max_answer_length = 60000
+        self.max_question_length    = 60000
+        self.max_answer_length      = 60000
 
-        # Embedding model (lazy loading)
         self._embedding_model = None
 
-    # ==================== CONNECTION ====================
+    # ──────────────────────────────────────────────
+    # CONNECTION
+    # ──────────────────────────────────────────────
 
     async def initialize(self, max_retries: int = 5, retry_delay: int = 2):
-        """Initialize Milvus connection and create all collections"""
         for attempt in range(max_retries):
             try:
-                logger.info(
-                    f"Attempting to connect to Milvus at {self.host}:{self.port} "
-                    f"(attempt {attempt + 1}/{max_retries})"
-                )
-
-                # Auto-detect Docker environment
+                logger.info(f"Connecting to Milvus {self.host}:{self.port} (attempt {attempt+1}/{max_retries})")
                 if self.host == "milvus":
                     import socket
                     try:
                         socket.gethostbyname("milvus")
                     except socket.gaierror:
                         self.host = "localhost"
-                        logger.warning("⚠️ Running outside Docker, using localhost")
-
-                # Disconnect existing connection
+                        logger.warning("Running outside Docker → localhost")
                 try:
                     connections.disconnect("default")
-                except:
+                except Exception:
                     pass
-
-                # Connect
                 connections.connect("default", host=self.host, port=self.port)
-                logger.info(f"✅ Connected to Milvus at {self.host}:{self.port}")
+                logger.info(f"✅ Connected to Milvus {self.host}:{self.port}")
 
-                # Create all collections
                 await self.create_document_collection()
                 await self.create_faq_collection()
                 await self.create_url_collection()
+                await self.create_user_groups_collection()
 
                 self.is_initialized = True
-                logger.info("✅ Milvus initialization completed successfully")
+                logger.info("✅ Milvus initialization complete")
                 return True
-
             except Exception as e:
-                logger.error(
-                    f"❌ Milvus initialization error "
-                    f"(attempt {attempt + 1}/{max_retries}): {e}"
-                )
+                logger.error(f"❌ Init error (attempt {attempt+1}): {e}")
                 if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                 else:
-                    logger.error(f"❌ Failed to initialize after {max_retries} attempts")
                     self.is_initialized = False
                     raise e
 
     def _check_initialized(self):
-        """Check if Milvus is initialized"""
         if not self.is_initialized:
-            raise Exception(
-                "Milvus is not initialized. The service may be unavailable. "
-                "Please check Milvus connection and restart the application."
-            )
+            raise Exception("Milvus not initialized.")
 
-    # ==================== EMBEDDING MODEL ====================
+    # ──────────────────────────────────────────────
+    # EMBEDDING MODEL (lazy)
+    # ──────────────────────────────────────────────
 
     @property
     def embedding_model(self):
-        """Lazy load embedding model (FORCE CPU)"""
         if self._embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-
-                logger.info("🔄 Loading Vietnamese SBERT model (CPU mode)...")
-                device = 'cpu'
-
-                self._embedding_model = SentenceTransformer(
-                    'keepitreal/vietnamese-sbert',
-                    device=device
-                )
-
-                logger.info(f"✅ Embedding model loaded on {device}")
-
-            except ImportError:
-                logger.error("❌ sentence-transformers not installed")
-                raise ImportError("Run: pip install sentence-transformers")
-            except Exception as e:
-                logger.error(f"❌ Failed to load embedding model: {e}")
-                raise
-
+            from sentence_transformers import SentenceTransformer
+            logger.info("Loading Vietnamese SBERT (CPU) …")
+            self._embedding_model = SentenceTransformer("keepitreal/vietnamese-sbert", device="cpu")
+            logger.info("✅ Embedding model ready")
         return self._embedding_model
 
     def embed_text(self, text: str) -> List[float]:
-        """Generate embedding for text"""
         try:
             if not text or not text.strip():
                 return [0.0] * self.embedding_dim
-
-            embedding = self.embedding_model.encode(
-                text.strip(),
-                normalize_embeddings=True
-            )
-
-            return embedding.tolist()
-
+            return self.embedding_model.encode(text.strip(), normalize_embeddings=True).tolist()
         except Exception as e:
-            logger.error(f"❌ Embedding error: {e}")
+            logger.error(f"Embedding error: {e}")
             return [0.0] * self.embedding_dim
 
-    # ==================== COLLECTION CREATION ====================
+    # ──────────────────────────────────────────────
+    # COLLECTION CREATION
+    # ──────────────────────────────────────────────
 
     async def create_document_collection(self):
-        """Create document_embeddings collection with HNSW index"""
+        """document_embeddings – now includes ACL fields."""
         try:
             if utility.has_collection(self.doc_collection_name):
-                logger.info(f"📦 Collection {self.doc_collection_name} already exists")
+                logger.info(f"Collection {self.doc_collection_name} exists – loading.")
                 self.doc_collection = Collection(self.doc_collection_name)
-                await self._optimize_collection_index(
-                    self.doc_collection,
-                    "description_vector"
-                )
+                await self._optimize_collection_index(self.doc_collection, "description_vector")
                 self.doc_collection.load()
-                logger.info(f"✅ Loaded existing collection {self.doc_collection_name}")
                 return
 
-            logger.info(f"🔨 Creating NEW collection: {self.doc_collection_name}")
-
-            # Create new collection
+            logger.info(f"Creating {self.doc_collection_name} …")
             fields = [
-                FieldSchema(
-                    name="id",
-                    dtype=DataType.VARCHAR,
-                    max_length=200,
-                    is_primary=True
-                ),
-                FieldSchema(
-                    name="document_id",
-                    dtype=DataType.VARCHAR,
-                    max_length=100
-                ),
-                FieldSchema(
-                    name="description",
-                    dtype=DataType.VARCHAR,
-                    max_length=65000
-                ),
-                FieldSchema(
-                    name="description_vector",
-                    dtype=DataType.FLOAT_VECTOR,
-                    dim=self.embedding_dim
-                )
+                FieldSchema(name="id",              dtype=DataType.VARCHAR, max_length=200, is_primary=True),
+                FieldSchema(name="document_id",     dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="description",     dtype=DataType.VARCHAR, max_length=65000),
+                FieldSchema(name="description_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
+                # ── ACL fields ──────────────────────────────────────────────
+                FieldSchema(name="acl_group_id",      dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_company_id",    dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_department_id", dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_user_id",       dtype=DataType.VARCHAR, max_length=100),
+                # ── upload owner ────────────────────────────────────────────
+                FieldSchema(name="uploaded_by",       dtype=DataType.VARCHAR, max_length=100),
             ]
-
-            schema = CollectionSchema(
-                fields=fields,
-                description="Document embeddings collection (768D) - Optimized"
-            )
-
-            self.doc_collection = Collection(
-                name=self.doc_collection_name,
-                schema=schema,
-                using='default'
-            )
-
-            # HNSW index for fast search
-            index_params = {
-                "metric_type": "COSINE",
-                "index_type": "HNSW",
-                "params": {
-                    "M": 16,
-                    "efConstruction": 200
-                }
-            }
-
+            schema = CollectionSchema(fields, description="Document embeddings (768D) + ACL")
+            self.doc_collection = Collection(self.doc_collection_name, schema=schema, using="default")
             self.doc_collection.create_index(
                 field_name="description_vector",
-                index_params=index_params
+                index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
             )
-
             self.doc_collection.load()
-            logger.info(f"✅ Collection {self.doc_collection_name} created with HNSW index")
-            logger.info(f"   → Total fields: {len(fields)}")
-            logger.info(f"   → Index type: HNSW (M=16, efConstruction=200)")
-
+            logger.info(f"✅ {self.doc_collection_name} created with ACL fields.")
         except Exception as e:
-            logger.error(f"❌ Document collection creation error: {e}")
-            raise e
+            logger.error(f"❌ create_document_collection: {e}")
+            raise
 
     async def create_faq_collection(self):
-        """Create faq_embeddings collection with HNSW index"""
         try:
             if utility.has_collection(self.faq_collection_name):
-                logger.info(f"📦 Collection {self.faq_collection_name} already exists")
+                logger.info(f"Collection {self.faq_collection_name} exists – loading.")
                 self.faq_collection = Collection(self.faq_collection_name)
-                await self._optimize_collection_index(
-                    self.faq_collection,
-                    "question_vector"
-                )
+                await self._optimize_collection_index(self.faq_collection, "question_vector")
                 self.faq_collection.load()
-                logger.info(f"✅ Loaded existing collection {self.faq_collection_name}")
                 return
 
-            logger.info(f"🔨 Creating NEW collection: {self.faq_collection_name}")
-
             fields = [
-                FieldSchema(
-                    name="faq_id",
-                    dtype=DataType.VARCHAR,
-                    max_length=100,
-                    is_primary=True
-                ),
-                FieldSchema(
-                    name="question",
-                    dtype=DataType.VARCHAR,
-                    max_length=65000
-                ),
-                FieldSchema(
-                    name="answer",
-                    dtype=DataType.VARCHAR,
-                    max_length=65000
-                ),
-                FieldSchema(
-                    name="question_vector",
-                    dtype=DataType.FLOAT_VECTOR,
-                    dim=self.embedding_dim
-                )
+                FieldSchema(name="faq_id",         dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+                FieldSchema(name="question",        dtype=DataType.VARCHAR, max_length=65000),
+                FieldSchema(name="answer",          dtype=DataType.VARCHAR, max_length=65000),
+                FieldSchema(name="question_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
             ]
-
-            schema = CollectionSchema(
-                fields=fields,
-                description="FAQ embeddings collection (768D) - Optimized"
-            )
-
-            self.faq_collection = Collection(
-                name=self.faq_collection_name,
-                schema=schema,
-                using='default'
-            )
-
-            index_params = {
-                "metric_type": "COSINE",
-                "index_type": "HNSW",
-                "params": {
-                    "M": 16,
-                    "efConstruction": 200
-                }
-            }
-
+            schema = CollectionSchema(fields, description="FAQ embeddings (768D)")
+            self.faq_collection = Collection(self.faq_collection_name, schema=schema, using="default")
             self.faq_collection.create_index(
                 field_name="question_vector",
-                index_params=index_params
+                index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
             )
-
             self.faq_collection.load()
-            logger.info(f"✅ Collection {self.faq_collection_name} created with HNSW index")
-            logger.info(f"   → Total fields: {len(fields)}")
-            logger.info(f"   → Index type: HNSW (M=16, efConstruction=200)")
-
+            logger.info(f"✅ {self.faq_collection_name} created.")
         except Exception as e:
-            logger.error(f"❌ FAQ collection creation error: {e}")
-            raise e
+            logger.error(f"❌ create_faq_collection: {e}")
+            raise
 
     async def create_url_collection(self):
-        """Create document_urls collection with filename embeddings"""
         try:
             if utility.has_collection(self.url_collection_name):
-                logger.info(f"📦 Collection {self.url_collection_name} already exists")
+                logger.info(f"Collection {self.url_collection_name} exists – loading.")
                 self.url_collection = Collection(self.url_collection_name)
                 self.url_collection.load()
-                logger.info(f"✅ Loaded existing collection {self.url_collection_name}")
                 return
-
-            logger.info(f"🔨 Creating NEW collection: {self.url_collection_name}")
 
             fields = [
-                FieldSchema(
-                    name="document_id",
-                    dtype=DataType.VARCHAR,
-                    max_length=100,
-                    is_primary=True,
-                    description="Unique document identifier"
-                ),
-                FieldSchema(
-                    name="url",
-                    dtype=DataType.VARCHAR,
-                    max_length=500,
-                    description="Public URL to the document"
-                ),
-                FieldSchema(
-                    name="filename",
-                    dtype=DataType.VARCHAR,
-                    max_length=200,
-                    description="Original filename"
-                ),
-                FieldSchema(
-                    name="file_type",
-                    dtype=DataType.VARCHAR,
-                    max_length=20,
-                    description="File extension (.pdf, .docx, etc.)"
-                ),
-                FieldSchema(
-                    name="filename_vector",
-                    dtype=DataType.FLOAT_VECTOR,
-                    dim=self.embedding_dim,
-                    description="Embedding of filename for semantic search"
-                )
+                FieldSchema(name="document_id",     dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+                FieldSchema(name="url",             dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="filename",        dtype=DataType.VARCHAR, max_length=200),
+                FieldSchema(name="file_type",       dtype=DataType.VARCHAR, max_length=20),
+                FieldSchema(name="filename_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
             ]
-
-            schema = CollectionSchema(
-                fields=fields,
-                description="Document URLs with filename embeddings for semantic search"
-            )
-
-            self.url_collection = Collection(
-                name=self.url_collection_name,
-                schema=schema,
-                using='default'
-            )
-
-            # Index for filename search
-            index_params = {
-                "metric_type": "COSINE",
-                "index_type": "IVF_FLAT",
-                "params": {"nlist": 128}
-            }
-
+            schema = CollectionSchema(fields, description="Document URLs + filename embeddings")
+            self.url_collection = Collection(self.url_collection_name, schema=schema, using="default")
             self.url_collection.create_index(
                 field_name="filename_vector",
-                index_params=index_params
+                index_params={"metric_type": "COSINE", "index_type": "IVF_FLAT", "params": {"nlist": 128}},
             )
-
             self.url_collection.load()
-            logger.info(f"✅ Collection {self.url_collection_name} created successfully")
-            logger.info(f"   → Total fields: {len(fields)}")
-            logger.info(f"   → Index type: IVF_FLAT (nlist=128)")
-
+            logger.info(f"✅ {self.url_collection_name} created.")
         except Exception as e:
-            logger.error(f"❌ URL collection creation error: {e}")
-            raise e
+            logger.error(f"❌ create_url_collection: {e}")
+            raise
 
-    async def _optimize_collection_index(self, collection: Collection, vector_field: str):
-        """Check and optimize existing index if needed"""
+    async def create_user_groups_collection(self):
+        """user_groups collection (4-level ACL + token cost)."""
         try:
-            indexes = collection.indexes
-
-            if not indexes:
-                logger.warning(f"No index found on {collection.name}, creating HNSW index...")
-                collection.release()
-
-                index_params = {
-                    "metric_type": "COSINE",
-                    "index_type": "HNSW",
-                    "params": {
-                        "M": 16,
-                        "efConstruction": 200
-                    }
-                }
-
-                collection.create_index(
-                    field_name=vector_field,
-                    index_params=index_params
-                )
-
-                collection.load()
-                logger.info(f"✅ Created HNSW index on {collection.name}")
+            if utility.has_collection(self.ug_collection_name):
+                logger.info(f"Collection {self.ug_collection_name} exists – loading.")
+                self.ug_collection = Collection(self.ug_collection_name)
+                self.ug_collection.load()
                 return
 
-            # Check if using outdated IVF_FLAT
-            for index in indexes:
-                if index.params.get('index_type') == 'IVF_FLAT':
-                    logger.warning(
-                        f"Found IVF_FLAT index on {collection.name}, "
-                        f"upgrading to HNSW..."
-                    )
+            fields = [
+                FieldSchema(name="user_id",        dtype=DataType.VARCHAR, max_length=100, is_primary=True),
+                FieldSchema(name="group_id",        dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="company_id",      dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="department_id",   dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="username",        dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="password_hash",   dtype=DataType.VARCHAR, max_length=256),
+                FieldSchema(name="cost_llm_tokens", dtype=DataType.INT64),
+                FieldSchema(name="dummy_vector",    dtype=DataType.FLOAT_VECTOR, dim=2),
+            ]
+            schema = CollectionSchema(fields, description="User groups + access control (4-level)")
+            self.ug_collection = Collection(self.ug_collection_name, schema=schema, using="default")
+            self.ug_collection.create_index(
+                field_name="dummy_vector",
+                index_params={"metric_type": "L2", "index_type": "FLAT", "params": {}},
+            )
+            self.ug_collection.load()
+            logger.info(f"✅ {self.ug_collection_name} created.")
+        except Exception as e:
+            logger.error(f"❌ create_user_groups_collection: {e}")
+            raise
 
+    async def _optimize_collection_index(self, collection: Collection, vector_field: str):
+        try:
+            indexes = collection.indexes
+            if not indexes:
+                collection.release()
+                collection.create_index(
+                    field_name=vector_field,
+                    index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
+                )
+                collection.load()
+                return
+            for idx in indexes:
+                if idx.params.get("index_type") == "IVF_FLAT":
                     collection.release()
                     collection.drop_index()
-
-                    index_params = {
-                        "metric_type": "COSINE",
-                        "index_type": "HNSW",
-                        "params": {
-                            "M": 16,
-                            "efConstruction": 200
-                        }
-                    }
-
                     collection.create_index(
                         field_name=vector_field,
-                        index_params=index_params
+                        index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
                     )
-
                     collection.load()
-                    logger.info(f"✅ Upgraded to HNSW index on {collection.name}")
                     return
-
-            logger.info(f"✅ Index on {collection.name} is already optimized")
-
         except Exception as e:
-            logger.error(f"Error optimizing index: {e}")
+            logger.error(f"_optimize_collection_index error: {e}")
 
-    # ==================== DOCUMENT EMBEDDINGS ====================
+    # ──────────────────────────────────────────────
+    # DOCUMENT EMBEDDINGS  (ACL-aware insert)
+    # ──────────────────────────────────────────────
 
-    async def insert_embeddings(self, embeddings_data: List[Dict]) -> int:
-        """Insert document embeddings with progress logging"""
-        try:
-            self._check_initialized()
+    async def insert_embeddings(
+        self,
+        embeddings_data: List[Dict],
+        acl: Optional[Dict[str, str]] = None,
+        uploaded_by: str = "",
+    ) -> int:
+        """
+        Insert embeddings with optional ACL.
+        acl = { group_id, company_id, department_id, user_id }
+        Empty string = wildcard.
+        """
+        self._check_initialized()
+        if not self.doc_collection or not embeddings_data:
+            return 0
 
-            if not self.doc_collection:
-                raise Exception("Document collection not initialized")
+        acl = acl or {}
+        acl_group      = (acl.get("group_id",      "") or "")[:100]
+        acl_company    = (acl.get("company_id",    "") or "")[:100]
+        acl_department = (acl.get("department_id", "") or "")[:100]
+        acl_user       = (acl.get("user_id",       "") or "")[:100]
 
+        field_limits = {"id": self.max_id_length, "document_id": self.max_document_id_length, "description": self.max_description_length}
+        validated = [
+            self._validate_and_truncate(item, field_limits)
+            for item in embeddings_data
+            if all(k in item for k in ["id", "document_id", "description", "description_vector"])
+            and len(item["description_vector"]) == self.embedding_dim
+        ]
+        if not validated:
+            return 0
+
+        batch_size    = 100
+        total_inserted = 0
+        for i in range(0, len(validated), batch_size):
+            batch = validated[i : i + batch_size]
+            entities = [
+                [r["id"]          for r in batch],
+                [r["document_id"] for r in batch],
+                [r["description"] for r in batch],
+                [r["description_vector"] for r in batch],
+                [acl_group]      * len(batch),
+                [acl_company]    * len(batch),
+                [acl_department] * len(batch),
+                [acl_user]       * len(batch),
+                [uploaded_by]    * len(batch),
+            ]
             try:
-                self.doc_collection.load()
-            except:
-                pass
+                self.doc_collection.insert(entities)
+                total_inserted += len(batch)
+            except Exception as e:
+                logger.error(f"Batch insert error: {e}")
 
-            if not embeddings_data:
-                return 0
-
-            field_limits = {
-                "id": self.max_id_length,
-                "document_id": self.max_document_id_length,
-                "description": self.max_description_length
-            }
-
-            validated_data = []
-            for item in embeddings_data:
-                if not all(key in item for key in
-                           ["id", "document_id", "description", "description_vector"]):
-                    continue
-
-                validated_item = self._validate_and_truncate(item, field_limits)
-
-                if len(validated_item["description_vector"]) != self.embedding_dim:
-                    continue
-
-                validated_data.append(validated_item)
-
-            if not validated_data:
-                return 0
-
-            # Prepare data
-            ids = [item["id"] for item in validated_data]
-            document_ids = [item["document_id"] for item in validated_data]
-            descriptions = [item["description"] for item in validated_data]
-            vectors = [item["description_vector"] for item in validated_data]
-
-            # Insert in batches
-            batch_size = 100
-            total_inserted = 0
-            total_batches = (len(validated_data) + batch_size - 1) // batch_size
-
-            for i in range(0, len(validated_data), batch_size):
-                batch_ids = ids[i:i + batch_size]
-                batch_document_ids = document_ids[i:i + batch_size]
-                batch_descriptions = descriptions[i:i + batch_size]
-                batch_vectors = vectors[i:i + batch_size]
-
-                entities = [
-                    batch_ids,
-                    batch_document_ids,
-                    batch_descriptions,
-                    batch_vectors
-                ]
-
-                try:
-                    self.doc_collection.insert(entities)
-                    total_inserted += len(batch_ids)
-
-                    current_batch = (i // batch_size) + 1
-                    if current_batch % 10 == 0 or current_batch == total_batches:
-                        logger.info(
-                            f"Inserted batch {current_batch}/{total_batches}: "
-                            f"{total_inserted} items"
-                        )
-
-                except Exception as batch_error:
-                    logger.error(f"Error inserting batch {i // batch_size + 1}: {batch_error}")
-                    continue
-
-            self.doc_collection.flush()
-            logger.info(f"✅ Total inserted: {total_inserted} embeddings")
-            return total_inserted
-
-        except Exception as e:
-            logger.error(f"❌ Insert error: {e}")
-            raise e
+        self.doc_collection.flush()
+        logger.info(f"✅ Inserted {total_inserted} embeddings (ACL: {acl})")
+        return total_inserted
 
     async def delete_document(self, document_id: str) -> bool:
-        """Delete all embeddings for a document"""
+        self._check_initialized()
         try:
-            self._check_initialized()
-
-            if not self.doc_collection:
-                raise Exception("Document collection not initialized")
-
-            expr = f'document_id == "{document_id}"'
-            self.doc_collection.delete(expr)
-
-            logger.info(f"✅ Deleted all embeddings for document_id: {document_id}")
+            self.doc_collection.delete(f'document_id == "{document_id}"')
             return True
-
         except Exception as e:
-            logger.error(f"❌ Document delete error: {e}")
+            logger.error(f"delete_document error: {e}")
             return False
 
-    # ==================== FAQ ====================
+    # ──────────────────────────────────────────────
+    # FAQ
+    # ──────────────────────────────────────────────
 
-    async def insert_faq(
-            self,
-            faq_id: str,
-            question: str,
-            answer: str,
-            question_vector: List[float]
-    ) -> bool:
-        """Insert FAQ"""
+    async def insert_faq(self, faq_id, question, answer, question_vector) -> bool:
+        self._check_initialized()
         try:
-            self._check_initialized()
-
-            if not self.faq_collection:
-                raise Exception("FAQ collection not initialized")
-
-            try:
-                self.faq_collection.load()
-            except:
-                pass
-
-            # Truncate fields
-            if len(faq_id) > 90:
-                faq_id = faq_id[:90]
-            if len(question) > self.max_question_length:
-                question = question[:self.max_question_length - 3] + "..."
-            if len(answer) > self.max_answer_length:
-                answer = answer[:self.max_answer_length - 3] + "..."
-
+            if len(faq_id) > 90:           faq_id   = faq_id[:90]
+            if len(question) > self.max_question_length: question = question[:self.max_question_length-3] + "..."
+            if len(answer)   > self.max_answer_length:   answer   = answer[:self.max_answer_length-3]   + "..."
             if len(question_vector) != self.embedding_dim:
                 return False
-
-            entities = [[faq_id], [question], [answer], [question_vector]]
-            self.faq_collection.insert(entities)
+            self.faq_collection.insert([[faq_id],[question],[answer],[question_vector]])
             self.faq_collection.flush()
-
-            logger.info(f"✅ Inserted FAQ with id: {faq_id}")
             return True
-
         except Exception as e:
-            logger.error(f"❌ FAQ insert error: {e}")
+            logger.error(f"insert_faq error: {e}")
             return False
 
     async def delete_faq(self, faq_id: str) -> bool:
-        """Delete FAQ by ID"""
+        self._check_initialized()
         try:
-            self._check_initialized()
-
-            if not self.faq_collection:
-                raise Exception("FAQ collection not initialized")
-
-            expr = f'faq_id == "{faq_id}"'
-            self.faq_collection.delete(expr)
-
-            logger.info(f"✅ Deleted FAQ with id: {faq_id}")
+            self.faq_collection.delete(f'faq_id == "{faq_id}"')
             return True
-
         except Exception as e:
-            logger.error(f"❌ FAQ delete error: {e}")
+            logger.error(f"delete_faq error: {e}")
             return False
 
-    # ==================== DOCUMENT URLS ====================
+    # ──────────────────────────────────────────────
+    # DOCUMENT URLS
+    # ──────────────────────────────────────────────
 
-    def insert_url(
-            self,
-            document_id: str,
-            url: str,
-            filename: str = "",
-            file_type: str = ""
-    ) -> bool:
-        """Insert or update document URL with filename embedding"""
+    def insert_url(self, document_id, url, filename="", file_type="") -> bool:
         try:
             if not self.url_collection:
-                raise Exception("URL collection not initialized")
-
-            # Validate and truncate
-            if len(document_id) > 100:
-                document_id = document_id[:100]
-            if len(url) > 500:
-                logger.warning(f"URL too long, truncating: {url[:50]}...")
-                url = url[:500]
-            if len(filename) > 200:
-                filename = filename[:200]
-            if len(file_type) > 20:
-                file_type = file_type[:20]
-
-            # Generate filename embedding
-            logger.info(f"🔄 Embedding filename: {filename}")
-            filename_embedding = self.embed_text(filename)
-
-            # Delete existing entry if any
+                return False
+            document_id = document_id[:100]; url = url[:500]; filename = filename[:200]; file_type = file_type[:20]
+            vec = self.embed_text(filename)
             try:
-                expr = f'document_id == "{document_id}"'
-                existing = self.url_collection.query(
-                    expr=expr,
-                    output_fields=["document_id"],
-                    limit=1
-                )
-
+                existing = self.url_collection.query(expr=f'document_id == "{document_id}"', output_fields=["document_id"], limit=1)
                 if existing:
-                    self.url_collection.delete(expr=f'document_id in ["{document_id}"]')
-                    logger.debug(f"Deleted existing entry for {document_id}")
-            except Exception as del_error:
-                logger.debug(f"No existing entry or delete failed: {del_error}")
-
-            # Insert new entry
-            entities = [
-                [document_id],
-                [url],
-                [filename],
-                [file_type],
-                [filename_embedding]
-            ]
-
-            self.url_collection.insert(entities)
+                    self.url_collection.delete(f'document_id in ["{document_id}"]')
+            except Exception:
+                pass
+            self.url_collection.insert([[document_id],[url],[filename],[file_type],[vec]])
             self.url_collection.flush()
-
-            logger.info(f"✅ Inserted URL for document: {document_id}")
             return True
-
         except Exception as e:
-            logger.error(f"❌ Error inserting URL: {e}")
+            logger.error(f"insert_url error: {e}")
             return False
-
-    def batch_insert_urls(self, documents: list) -> int:
-        """Batch insert document URLs with filename embeddings"""
-        try:
-            if not documents:
-                return 0
-
-            document_ids = []
-            urls = []
-            filenames = []
-            file_types = []
-            filename_vectors = []
-
-            logger.info(f"🔄 Generating embeddings for {len(documents)} filenames...")
-
-            for doc in documents:
-                document_id = doc.get('document_id', '')[:100]
-                url = doc.get('url', '')[:500]
-                filename = doc.get('filename', '')[:200]
-                file_type = doc.get('file_type', '')[:20]
-
-                if document_id and url:
-                    document_ids.append(document_id)
-                    urls.append(url)
-                    filenames.append(filename)
-                    file_types.append(file_type)
-
-                    filename_vector = self.embed_text(filename)
-                    filename_vectors.append(filename_vector)
-
-            if not document_ids:
-                logger.warning("No valid documents to insert")
-                return 0
-
-            # Delete existing entries
-            logger.info(f"🔄 Checking for existing entries...")
-            deleted_count = 0
-
-            for doc_id in document_ids:
-                try:
-                    expr = f'document_id == "{doc_id}"'
-                    existing = self.url_collection.query(
-                        expr=expr,
-                        output_fields=["document_id"],
-                        limit=1
-                    )
-
-                    if existing:
-                        self.url_collection.delete(expr=f'document_id in ["{doc_id}"]')
-                        deleted_count += 1
-                except Exception as e:
-                    logger.debug(f"Could not delete {doc_id}: {e}")
-                    continue
-
-            if deleted_count > 0:
-                logger.info(f"✅ Deleted {deleted_count} existing entries")
-
-            # Batch insert
-            entities = [
-                document_ids,
-                urls,
-                filenames,
-                file_types,
-                filename_vectors
-            ]
-
-            self.url_collection.insert(entities)
-            self.url_collection.flush()
-
-            logger.info(f"✅ Batch inserted {len(document_ids)} URLs with embeddings")
-            return len(document_ids)
-
-        except Exception as e:
-            logger.error(f"❌ Batch insert error: {e}")
-            return 0
-
-    def search_by_filename(
-            self,
-            query: str,
-            top_k: int = 5,
-            min_score: float = 0.3
-    ) -> List[Dict[str, Any]]:
-        """Search documents by filename using semantic search"""
-        try:
-            query_vector = self.embed_text(query)
-
-            search_params = {
-                "metric_type": "COSINE",
-                "params": {"nprobe": 16}
-            }
-
-            results = self.url_collection.search(
-                data=[query_vector],
-                anns_field="filename_vector",
-                param=search_params,
-                limit=top_k,
-                output_fields=["document_id", "url", "filename", "file_type"]
-            )
-
-            documents = []
-            for hits in results:
-                for hit in hits:
-                    if hit.score >= min_score:
-                        documents.append({
-                            "document_id": hit.entity.get("document_id"),
-                            "url": hit.entity.get("url"),
-                            "filename": hit.entity.get("filename"),
-                            "file_type": hit.entity.get("file_type"),
-                            "similarity_score": hit.score
-                        })
-
-            logger.info(f"✅ Found {len(documents)} documents for query: {query}")
-            return documents
-
-        except Exception as e:
-            logger.error(f"❌ Search error: {e}")
-            return []
-
-    def get_url(self, document_id: str) -> dict:
-        """Get URL for a document"""
-        try:
-            expr = f'document_id == "{document_id}"'
-
-            results = self.url_collection.query(
-                expr=expr,
-                output_fields=["url", "filename", "file_type"],
-                limit=1
-            )
-
-            if results:
-                return {
-                    "document_id": document_id,
-                    "url": results[0].get("url"),
-                    "filename": results[0].get("filename"),
-                    "file_type": results[0].get("file_type")
-                }
-
-            return None
-
-        except Exception as e:
-            logger.error(f"❌ Error getting URL: {e}")
-            return None
-
-    def batch_get_urls(self, document_ids: list) -> dict:
-        """Get URLs for multiple documents"""
-        try:
-            results = {}
-
-            for doc_id in document_ids:
-                url_info = self.get_url(doc_id)
-                if url_info:
-                    results[doc_id] = url_info
-
-            return results
-
-        except Exception as e:
-            logger.error(f"❌ Batch get error: {e}")
-            return {}
 
     def delete_url(self, document_id: str) -> bool:
-        """Delete URL entry"""
         try:
-            expr = f'document_id in ["{document_id}"]'
-            self.url_collection.delete(expr)
+            self.url_collection.delete(f'document_id in ["{document_id}"]')
             self.url_collection.flush()
-            logger.info(f"✅ Deleted URL for: {document_id}")
             return True
         except Exception as e:
-            logger.error(f"❌ Delete error: {e}")
+            logger.error(f"delete_url error: {e}")
             return False
 
-    # ==================== UTILITIES ====================
+    def get_url(self, document_id: str) -> Optional[Dict]:
+        try:
+            results = self.url_collection.query(
+                expr=f'document_id == "{document_id}"',
+                output_fields=["url","filename","file_type"], limit=1,
+            )
+            if results:
+                return {"document_id": document_id, **results[0]}
+            return None
+        except Exception as e:
+            logger.error(f"get_url error: {e}")
+            return None
 
-    def _validate_and_truncate(
-            self,
-            data: Dict[str, Any],
-            field_limits: Dict[str, int]
-    ) -> Dict[str, Any]:
-        """Validate and truncate fields"""
+    # ──────────────────────────────────────────────
+    # USER GROUPS
+    # ──────────────────────────────────────────────
+
+    def get_user(self, user_id: str) -> Optional[Dict]:
+        try:
+            results = self.ug_collection.query(
+                expr=f'user_id == "{user_id}"',
+                output_fields=["user_id","group_id","company_id","department_id","username","cost_llm_tokens"],
+                limit=1,
+            )
+            return results[0] if results else None
+        except Exception as e:
+            logger.error(f"get_user error: {e}")
+            return None
+
+    def update_token_cost(self, user_id: str, tokens_used: int) -> bool:
+        """Read-modify-write (Milvus does not support in-place update)."""
+        try:
+            full = self.ug_collection.query(
+                expr=f'user_id == "{user_id}"',
+                output_fields=["user_id","group_id","company_id","department_id",
+                                "username","password_hash","cost_llm_tokens"],
+                limit=1,
+            )
+            if not full:
+                return False
+            r = full[0]
+            new_total = r.get("cost_llm_tokens", 0) + tokens_used
+            self.ug_collection.delete(f'user_id in ["{user_id}"]')
+            self.ug_collection.insert([
+                [r["user_id"]], [r["group_id"]], [r["company_id"]], [r["department_id"]],
+                [r["username"]], [r["password_hash"]], [new_total], [[0.0, 0.0]],
+            ])
+            self.ug_collection.flush()
+            logger.info(f"✅ Token cost updated: {user_id} → {new_total}")
+            return True
+        except Exception as e:
+            logger.error(f"update_token_cost error: {e}")
+            return False
+
+    # ──────────────────────────────────────────────
+    # UTILITIES
+    # ──────────────────────────────────────────────
+
+    def _validate_and_truncate(self, data: Dict, field_limits: Dict) -> Dict:
         validated = data.copy()
-
-        for field, max_length in field_limits.items():
+        for field, max_len in field_limits.items():
             if field in validated and isinstance(validated[field], str):
-                if len(validated[field]) > max_length:
-                    validated[field] = validated[field][:max_length - 3] + "..."
-
+                if len(validated[field]) > max_len:
+                    validated[field] = validated[field][: max_len - 3] + "..."
         return validated
 
     async def health_check(self) -> bool:
-        """Check Milvus connection health"""
         try:
             if not self.is_initialized:
                 return False
             connections.get_connection_addr("default")
             return True
-        except:
+        except Exception:
             return False
 
-    async def get_collection_stats(self) -> Dict[str, Any]:
-        """Get statistics for all collections"""
-        try:
-            stats = {"initialized": self.is_initialized}
+    async def get_collection_stats(self) -> Dict:
+        stats = {"initialized": self.is_initialized}
+        for name, col in [
+            ("document_embeddings", self.doc_collection),
+            ("faq_embeddings",      self.faq_collection),
+            ("document_urls",       self.url_collection),
+            ("user_groups",         self.ug_collection),
+        ]:
+            if col:
+                try:
+                    stats[name] = {"count": col.num_entities}
+                except Exception:
+                    stats[name] = {"count": "?"}
+        return stats
 
-            if self.doc_collection:
-                self.doc_collection.load()
-                stats["document_embeddings"] = {
-                    "count": self.doc_collection.num_entities,
-                    "name": self.doc_collection_name
-                }
-                indexes = self.doc_collection.indexes
-                if indexes:
-                    stats["document_embeddings"]["index_type"] = indexes[0].params.get(
-                        'index_type', 'unknown'
-                    )
-
-            if self.faq_collection:
-                self.faq_collection.load()
-                stats["faq_embeddings"] = {
-                    "count": self.faq_collection.num_entities,
-                    "name": self.faq_collection_name
-                }
-                indexes = self.faq_collection.indexes
-                if indexes:
-                    stats["faq_embeddings"]["index_type"] = indexes[0].params.get(
-                        'index_type', 'unknown'
-                    )
-
-            if self.url_collection:
-                self.url_collection.load()
-                stats["document_urls"] = {
-                    "count": self.url_collection.num_entities,
-                    "name": self.url_collection_name
-                }
-
-            return stats
-
-        except Exception as e:
-            logger.error(f"❌ Stats error: {e}")
-            return {"error": str(e)}
-
-
-# ==================== MAIN ====================
 
 async def main():
-    """Test the Unified Milvus Manager"""
-
+    import json
     manager = MilvusManager(
         host=os.getenv("MILVUS_HOST", "localhost"),
-        port=os.getenv("MILVUS_PORT", "19530")
+        port=os.getenv("MILVUS_PORT", "19530"),
     )
-
-    # Initialize
     await manager.initialize()
-
-    # Print stats
     stats = await manager.get_collection_stats()
-    print("\n=== Collection Statistics ===")
-    import json
     print(json.dumps(stats, indent=2))
 
 

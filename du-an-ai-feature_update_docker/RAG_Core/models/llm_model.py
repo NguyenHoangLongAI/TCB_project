@@ -1,134 +1,141 @@
-# RAG_Core/models/llm_model.py - RAW OLLAMA STREAMING
+# RAG_Core/models/llm_model.py  (UPDATED – captures token usage from Ollama)
 
 from langchain_ollama import OllamaLLM
-from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 from config.settings import settings
-import traceback
-from typing import Iterator, Optional, AsyncIterator
-import logging
+import traceback, json, logging
+from typing import Iterator, AsyncIterator, Tuple, Optional
 import httpx
-import json
 
 logger = logging.getLogger(__name__)
 
 
 class LLMModel:
     def __init__(self):
-        logger.info(f"[LLMModel] Using model={settings.LLM_MODEL} base_url={getattr(settings, 'OLLAMA_URL', None)}")
-
-        # Initialize Ollama LLM for non-streaming
+        logger.info(f"[LLMModel] model={settings.LLM_MODEL} base_url={settings.OLLAMA_URL}")
         self.llm = OllamaLLM(
             model=settings.LLM_MODEL,
             base_url=getattr(settings, "OLLAMA_URL", "http://ollama:11434"),
             temperature=0.1,
         )
         self.output_parser = StrOutputParser()
+        self.ollama_url    = getattr(settings, "OLLAMA_URL", "http://ollama:11434")
+        self.model_name    = settings.LLM_MODEL
 
-        # Ollama API endpoint
-        self.ollama_url = getattr(settings, "OLLAMA_URL", "http://ollama:11434")
-        self.model_name = settings.LLM_MODEL
+    # ──────────────────────────────────────────────
+    # NON-STREAMING (returns text + token count)
+    # ──────────────────────────────────────────────
 
     def invoke(self, prompt: str, **kwargs) -> str:
-        """Non-streaming invoke"""
+        """Non-streaming invoke – returns text only (backward compat)."""
+        text, _ = self.invoke_with_usage(prompt, **kwargs)
+        return text
+
+    def invoke_with_usage(self, prompt: str, **kwargs) -> Tuple[str, int]:
+        """
+        Non-streaming invoke that also returns total token count.
+        Returns (answer_text, total_tokens).
+        """
         try:
-            resp = self.llm.invoke(prompt, **kwargs)
-            return self.output_parser.parse(resp)
+            url = f"{self.ollama_url}/api/generate"
+            payload = {
+                "model":   self.model_name,
+                "prompt":  prompt,
+                "stream":  False,
+                "options": {"temperature": 0.1},
+            }
+            response = httpx.post(url, json=payload, timeout=120.0)
+            response.raise_for_status()
+            data    = response.json()
+            text    = data.get("response", "")
+            tokens  = (data.get("prompt_eval_count", 0) or 0) + (data.get("eval_count", 0) or 0)
+            return self.output_parser.parse(text), tokens
         except Exception as e:
             traceback.print_exc()
-            return f"Lỗi xử lý: {str(e)}"
+            return f"Lỗi xử lý: {str(e)}", 0
+
+    # ──────────────────────────────────────────────
+    # STREAMING
+    # ──────────────────────────────────────────────
 
     def stream(self, prompt: str, **kwargs) -> Iterator[str]:
-        """Sync streaming using raw Ollama API"""
+        """Sync streaming – yields text chunks."""
         try:
-            logger.info(f"Starting sync stream with raw Ollama API...")
-
             url = f"{self.ollama_url}/api/generate"
-            payload = {
-                "model": self.model_name,
-                "prompt": prompt,
-                "stream": True,
-                "options": {
-                    "temperature": 0.1
-                }
-            }
-
-            with httpx.stream("POST", url, json=payload, timeout=60.0) as response:
-                response.raise_for_status()
-
-                for line in response.iter_lines():
+            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
+            with httpx.stream("POST", url, json=payload, timeout=60.0) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
                     if line:
                         try:
-                            data = json.loads(line)
-                            chunk_text = data.get("response", "")
-
-                            if chunk_text:
-                                yield chunk_text
-
+                            d = json.loads(line)
+                            chunk = d.get("response", "")
+                            if chunk:
+                                yield chunk
                         except json.JSONDecodeError:
                             continue
-
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            traceback.print_exc()
-            yield f"\n\n[Lỗi streaming: {str(e)}]"
+            yield f"\n\n[Lỗi streaming: {e}]"
 
     async def astream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """
-        FIXED: Async streaming using raw Ollama API
-        """
+        """Async streaming – yields text chunks (no token tracking mid-stream)."""
         try:
-            logger.info(f"🚀 Starting async stream with raw Ollama API...")
-            logger.info(f"📝 Prompt length: {len(prompt)}")
-
             url = f"{self.ollama_url}/api/generate"
-            payload = {
-                "model": self.model_name,
-                "prompt": prompt,
-                "stream": True,
-                "options": {
-                    "temperature": 0.1
-                }
-            }
-
-            chunk_count = 0
-            total_text = ""
-
+            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
             async with httpx.AsyncClient(timeout=60.0) as client:
-                async with client.stream("POST", url, json=payload) as response:
-                    response.raise_for_status()
-
-                    async for line in response.aiter_lines():
+                async with client.stream("POST", url, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
                         if line:
                             try:
-                                data = json.loads(line)
-                                chunk_text = data.get("response", "")
-
-                                if chunk_text:
-                                    chunk_count += 1
-                                    total_text += chunk_text
-                                    logger.debug(f"✅ Chunk #{chunk_count}: '{chunk_text[:30]}...'")
-                                    yield chunk_text
-
-                                # Check if done
-                                if data.get("done", False):
-                                    logger.info(f"🏁 Stream completed")
+                                d = json.loads(line)
+                                chunk = d.get("response", "")
+                                if chunk:
+                                    yield chunk
+                                if d.get("done"):
                                     break
-
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Failed to parse JSON line: {e}")
+                            except json.JSONDecodeError:
                                 continue
-
-            logger.info(f"📊 Total chunks: {chunk_count}")
-            logger.info(f"📊 Total text length: {len(total_text)}")
-
         except Exception as e:
-            logger.error(f"❌ Async streaming FAILED: {e}", exc_info=True)
-            traceback.print_exc()
-            yield f"\n\n[Lỗi streaming: {str(e)}]"
+            logger.error(f"Async streaming error: {e}", exc_info=True)
+            yield f"\n\n[Lỗi streaming: {e}]"
+
+    async def astream_with_usage(self, prompt: str, **kwargs):
+        """
+        Async streaming that also captures final token usage from Ollama.
+        Yields str chunks, then finally yields a dict {'token_usage': N}.
+        """
+        total_tokens = 0
+        try:
+            url = f"{self.ollama_url}/api/generate"
+            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream("POST", url, json=payload) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line:
+                            try:
+                                d = json.loads(line)
+                                chunk = d.get("response", "")
+                                if chunk:
+                                    yield chunk
+                                if d.get("done"):
+                                    prompt_tokens = d.get("prompt_eval_count", 0) or 0
+                                    eval_tokens   = d.get("eval_count", 0)         or 0
+                                    total_tokens  = prompt_tokens + eval_tokens
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+        except Exception as e:
+            logger.error(f"astream_with_usage error: {e}", exc_info=True)
+            yield f"\n\n[Lỗi streaming: {e}]"
+
+        # Final sentinel dict with token info
+        yield {"__token_usage__": total_tokens}
 
     def create_chain(self, template: str):
-        """Create a non-streaming chain"""
         prompt = PromptTemplate.from_template(template)
         return prompt | self.llm | self.output_parser
 

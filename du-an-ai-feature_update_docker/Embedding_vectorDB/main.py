@@ -1,680 +1,451 @@
-# Embedding_vectorDB/main.py - UNIFIED API
+# Embedding_vectorDB/main.py  (UPDATED – user_groups + ACL + /create/user)
 """
-Unified Document Processing API
-Gộp 3 tác vụ: Process -> Embed -> Upload MinIO -> Store URL
+Unified Document Processing API  v4.0
+New:
+  • /create/user            – tạo user mới (tokens bắt đầu = 0)
+  • /api/v1/process-document – thêm trường user_id, tự build ACL từ user_groups
+  • user_groups collection   – seed 5 users mẫu lúc startup
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import tempfile
-import os
-import uuid
-import re
+import uvicorn, tempfile, os, uuid, re, json, hashlib, logging
 from typing import Optional
-import json
-import logging
-
-# Import processing modules
-from document_processor import DocumentProcessor
-from embedding_service import EmbeddingService
-from milvus_client import MilvusManager
-
-# Import MinIO
-from minio import Minio
 from pathlib import Path
+
+from document_processor import DocumentProcessor
+from embedding_service   import EmbeddingService
+from milvus_client       import MilvusManager          # updated version
+from user_groups_collection import UserGroupsManager, seed_sample_users
+
+from minio import Minio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Unified Document Processing API",
-    version="3.0.0",
-    description="All-in-one: Process + Embed + Upload MinIO + Store URL"
-)
-
-# CORS middleware
+app = FastAPI(title="Unified Document Processing API", version="4.0.0")
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# =====================================================================
-# GLOBAL SERVICES INITIALIZATION
-# =====================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBALS
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Milvus Manager
-milvus_host = os.getenv('MILVUS_HOST', 'localhost')
-milvus_port = os.getenv('MILVUS_PORT', '19530')
+milvus_host = os.getenv("MILVUS_HOST", "localhost")
+milvus_port = os.getenv("MILVUS_PORT", "19530")
+
 milvus_manager = MilvusManager(host=milvus_host, port=milvus_port)
-
-# Document Processor
-doc_processor = DocumentProcessor(use_docling=True, use_ocr=True)
-
-# Embedding Service
-embedding_service = EmbeddingService()
+doc_processor  = DocumentProcessor(use_docling=True, use_ocr=True)
+embedding_svc  = EmbeddingService()
+user_mgr       = UserGroupsManager(host=milvus_host, port=milvus_port)
 
 
-# MinIO Client - FIX: Separate internal and public endpoints
 def get_minio_config():
-    """
-    Get MinIO configuration with separate internal and public endpoints
-
-    Returns:
-        tuple: (internal_endpoint, public_endpoint, access_key, secret_key, bucket, secure)
-    """
-    # Internal endpoint (for Docker services to communicate)
-    internal_endpoint = os.getenv('MINIO_INTERNAL_ENDPOINT', '')
-    if not internal_endpoint:
-        # Auto-detect
+    internal = os.getenv("MINIO_INTERNAL_ENDPOINT", "")
+    if not internal:
+        import socket
         try:
-            import socket
-            socket.gethostbyname('minio')
-            internal_endpoint = 'minio:9000'
-            logger.info("🐳 Docker environment detected")
-        except (socket.gaierror, OSError):
-            internal_endpoint = 'localhost:9000'
-            logger.info("💻 Local environment detected")
-
-    # Public endpoint (for users to access from browser)
-    public_endpoint = os.getenv('MINIO_PUBLIC_ENDPOINT', '')
-    if not public_endpoint:
-        # Default to localhost for public access
-        # In production, this should be your actual domain
-        public_endpoint = 'localhost:9000'
-
-    access_key = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-    secret_key = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-    bucket = os.getenv('MINIO_BUCKET', 'public-documents')
-    secure = os.getenv('MINIO_SECURE', 'false').lower() == 'true'
-
-    logger.info(f"🔧 MinIO Configuration:")
-    logger.info(f"   Internal Endpoint (Docker): {internal_endpoint}")
-    logger.info(f"   Public Endpoint (Browser): {public_endpoint}")
-    logger.info(f"   Bucket: {bucket}")
-    logger.info(f"   Secure: {secure}")
-
-    return internal_endpoint, public_endpoint, access_key, secret_key, bucket, secure
+            socket.gethostbyname("minio")
+            internal = "minio:9000"
+        except Exception:
+            internal = "localhost:9000"
+    public      = os.getenv("MINIO_PUBLIC_ENDPOINT", "localhost:9000")
+    access_key  = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    secret_key  = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    bucket      = os.getenv("MINIO_BUCKET", "public-documents")
+    secure      = os.getenv("MINIO_SECURE", "false").lower() == "true"
+    return internal, public, access_key, secret_key, bucket, secure
 
 
-# Get MinIO configuration
-minio_internal_endpoint, minio_public_endpoint, minio_access_key, minio_secret_key, minio_bucket, minio_secure = get_minio_config()
+minio_internal, minio_public, minio_ak, minio_sk, minio_bucket, minio_secure = get_minio_config()
+minio_client = Minio(minio_internal, access_key=minio_ak, secret_key=minio_sk, secure=minio_secure)
 
-# MinIO client uses INTERNAL endpoint for operations
-minio_client = Minio(
-    minio_internal_endpoint,
-    access_key=minio_access_key,
-    secret_key=minio_secret_key,
-    secure=minio_secure
-)
-
-# Ensure bucket exists
 try:
     if not minio_client.bucket_exists(minio_bucket):
         minio_client.make_bucket(minio_bucket)
-        logger.info(f"✅ Created MinIO bucket: {minio_bucket}")
-
-    # Set public read policy
-    policy = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Principal": {"AWS": "*"},
-                "Action": ["s3:GetObject"],
-                "Resource": [f"arn:aws:s3:::{minio_bucket}/*"]
-            }
-        ]
-    }
+    policy = {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject"],"Resource":[f"arn:aws:s3:::{minio_bucket}/*"]}]}
     minio_client.set_bucket_policy(minio_bucket, json.dumps(policy))
-    logger.info(f"✅ MinIO bucket is public: {minio_bucket}")
 except Exception as e:
-    logger.warning(f"⚠️ MinIO setup warning: {e}")
+    logger.warning(f"MinIO setup: {e}")
 
-
-# =====================================================================
-# HELPER FUNCTIONS
-# =====================================================================
-
-def sanitize_filename(filename: str) -> str:
-    """Sanitize filename to be safe"""
-    if not filename:
-        return "unknown_file"
-
-    name, ext = os.path.splitext(filename)
-    safe_name = re.sub(r'[^\w\-_.]', '_', name)
-    safe_name = re.sub(r'_+', '_', safe_name)
-    safe_name = safe_name.strip('_')
-
-    if not safe_name:
-        safe_name = "document"
-
-    return safe_name + ext.lower()
-
-
-def sanitize_id(text: str) -> str:
-    """Sanitize document ID"""
-    sanitized = re.sub(r"[^\w\-_.]", "_", text)
-    sanitized = re.sub(r"_+", "_", sanitized)
-    return sanitized.strip("_")
-
-
-def get_safe_temp_filename(original_filename: str) -> str:
-    """Generate safe temporary filename"""
-    _, ext = os.path.splitext(original_filename)
-    unique_id = str(uuid.uuid4())[:8]
-    return f"temp_doc_{unique_id}{ext.lower()}"
-
-
-def upload_to_minio(file_path: str, document_id: str) -> str:
-    """
-    Upload file to MinIO and return PUBLIC URL (accessible from browser)
-
-    Args:
-        file_path: Local file path
-        document_id: Document identifier
-
-    Returns:
-        Public URL to the file (using public endpoint)
-    """
-    try:
-        file_ext = Path(file_path).suffix.lower()
-        object_name = f"{document_id}{file_ext}"
-
-        # Content type mapping
-        content_types = {
-            '.pdf': 'application/pdf',
-            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            '.doc': 'application/msword',
-            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            '.xls': 'application/vnd.ms-excel',
-            '.txt': 'text/plain'
-        }
-
-        content_type = content_types.get(file_ext, 'application/octet-stream')
-
-        # Upload to MinIO using INTERNAL endpoint
-        logger.info(f"📤 Uploading {object_name} to MinIO bucket: {minio_bucket}")
-        logger.info(f"   Using internal endpoint: {minio_internal_endpoint}")
-
-        minio_client.fput_object(
-            minio_bucket,
-            object_name,
-            file_path,
-            content_type=content_type
-        )
-
-        # Generate PUBLIC URL using public endpoint
-        protocol = "https" if minio_secure else "http"
-        public_url = f"{protocol}://{minio_public_endpoint}/{minio_bucket}/{object_name}"
-
-        logger.info(f"✅ Uploaded to MinIO: {object_name}")
-        logger.info(f"🔗 Public URL (for browser): {public_url}")
-
-        return public_url
-
-    except Exception as e:
-        logger.error(f"❌ MinIO upload failed: {e}")
-        raise Exception(f"MinIO upload error: {e}")
-
-
-# =====================================================================
-# STARTUP EVENT
-# =====================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Milvus connection and create collections"""
-    try:
-        await milvus_manager.initialize()
-        logger.info("✅ Unified Document API started successfully")
-        logger.info(f"✅ Milvus connected: {milvus_host}:{milvus_port}")
-        logger.info(f"✅ MinIO connected (internal): {minio_internal_endpoint}")
-        logger.info(f"✅ MinIO public endpoint: {minio_public_endpoint}")
-        logger.info("✅ Smart Chunking enabled")
-    except Exception as e:
-        logger.error(f"⚠️ Warning during startup: {e}")
+    await milvus_manager.initialize()
+    logger.info("Seeding sample users …")
+    seed_sample_users(user_mgr)
+    logger.info("✅ Unified Document API v4.0 ready")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sanitize_filename(name: str) -> str:
+    n, ext = os.path.splitext(name)
+    safe = re.sub(r"[^\w\-_.]", "_", n)
+    safe = re.sub(r"_+", "_", safe).strip("_") or "document"
+    return safe + ext.lower()
 
 
-# =====================================================================
-# API ENDPOINTS
-# =====================================================================
+def sanitize_id(text: str) -> str:
+    s = re.sub(r"[^\w\-_.]", "_", text)
+    return re.sub(r"_+", "_", s).strip("_")
+
+
+def upload_to_minio(file_path: str, document_id: str) -> str:
+    ext = Path(file_path).suffix.lower()
+    obj = f"{document_id}{ext}"
+    ct_map = {".pdf":"application/pdf",".docx":"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              ".doc":"application/msword",".xlsx":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              ".xls":"application/vnd.ms-excel",".txt":"text/plain"}
+    minio_client.fput_object(minio_bucket, obj, file_path, content_type=ct_map.get(ext, "application/octet-stream"))
+    proto = "https" if minio_secure else "http"
+    return f"{proto}://{minio_public}/{minio_bucket}/{obj}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROOT
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    return {"service": "Unified Document Processing API", "version": "4.0.0",
+            "endpoints": {
+                "process_document": "POST /api/v1/process-document (requires user_id)",
+                "create_user":      "POST /create/user",
+                "get_user":         "GET  /user/{user_id}",
+                "list_users":       "GET  /users",
+                "health":           "GET  /api/v1/health",
+            }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/create/user")
+async def create_user(request: dict):
+    """
+    Tạo user mới với cost_llm_tokens khởi điểm = 0.
+
+    Body:
+      user_id       : string (required)
+      username      : string (required)
+      password      : string (required)
+      group_id      : string (required)  – e.g. "Techcombank_group"
+      company_id    : string | null      – empty = wildcard
+      department_id : string | null      – empty = wildcard
+    """
+    user_id       = (request.get("user_id", "") or "").strip()
+    username      = (request.get("username", "") or "").strip()
+    password      = (request.get("password", "") or "").strip()
+    group_id      = (request.get("group_id", "") or "").strip()
+    company_id    = request.get("company_id")    or ""
+    department_id = request.get("department_id") or ""
+
+    if not user_id:   raise HTTPException(400, "user_id is required")
+    if not username:  raise HTTPException(400, "username is required")
+    if not password:  raise HTTPException(400, "password is required")
+    if not group_id:  raise HTTPException(400, "group_id is required")
+
+    ok = user_mgr.create_user(
+        user_id=sanitize_id(user_id),
+        username=username,
+        password=password,
+        group_id=group_id,
+        company_id=company_id,
+        department_id=department_id,
+        initial_tokens=0,
+    )
+    if not ok:
+        raise HTTPException(409, f"user_id '{user_id}' already exists")
+
     return {
-        "service": "Unified Document Processing API",
-        "version": "3.0.0",
-        "status": "running",
-        "features": {
-            "document_processing": "enabled",
-            "smart_chunking": "enabled",
-            "embedding": "enabled",
-            "minio_storage": "enabled",
-            "url_management": "enabled"
+        "status":  "success",
+        "message": f"User '{user_id}' created successfully",
+        "user": {
+            "user_id":       user_id,
+            "username":      username,
+            "group_id":      group_id,
+            "company_id":    company_id    or None,
+            "department_id": department_id or None,
+            "cost_llm_tokens": 0,
         },
-        "endpoints": {
-            "process_document": "/api/v1/process-document (POST)",
-            "add_faq": "/api/v1/faq/add (POST)",
-            "delete_faq": "/api/v1/faq/delete/{faq_id} (DELETE)",
-            "delete_document": "/api/v1/document/delete/{document_id} (DELETE)",
-            "health": "/api/v1/health (GET)"
-        }
     }
 
 
+@app.get("/user/{user_id}")
+async def get_user(user_id: str):
+    u = user_mgr.get_user(user_id)
+    if not u:
+        raise HTTPException(404, f"user_id '{user_id}' not found")
+    return {"status": "success", "user": u}
+
+
+@app.post("/user/{user_id}/tokens")
+async def increment_tokens(user_id: str, request: dict):
+    """
+    Increment cost_llm_tokens for a user.
+    Called by RAG API after each LLM invocation.
+
+    Body: { "tokens_used": int }
+    """
+    tokens_used = int(request.get("tokens_used", 0))
+    if tokens_used <= 0:
+        return {"status": "skipped", "reason": "tokens_used <= 0"}
+
+    ok = user_mgr.update_token_cost(user_id, tokens_used)
+    if not ok:
+        raise HTTPException(404, f"user_id '{user_id}' not found or update failed")
+
+    updated_user = user_mgr.get_user(user_id)
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "tokens_added": tokens_used,
+        "total_tokens": updated_user.get("cost_llm_tokens", 0) if updated_user else "unknown",
+    }
+
+
+@app.get("/users")
+async def list_users(limit: int = 100):
+    users = user_mgr.list_users(limit=limit)
+    return {"status": "success", "count": len(users), "users": users}
+
+
+@app.post("/auth/login")
+async def login(request: dict):
+    """Authenticate user. Returns user info on success."""
+    username = (request.get("username") or "").strip()
+    password = (request.get("password") or "").strip()
+    if not username or not password:
+        raise HTTPException(400, "username and password required")
+    user = user_mgr.authenticate(username, password)
+    if not user:
+        raise HTTPException(401, "Invalid username or password")
+    return {"status": "success", "user": user}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESS DOCUMENT  (ACL-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/api/v1/process-document")
 async def process_document(
-        file: UploadFile = File(...),
-        document_id: Optional[str] = Form(None),
-        chunk_mode: str = Form("smart")
+    file:        UploadFile = File(...),
+    document_id: Optional[str] = Form(None),
+    chunk_mode:  str = Form("smart"),
+    user_id:     Optional[str] = Form(None),   # NEW
+    # Explicit ACL override (optional – if not provided, inherits from user_groups)
+    acl_group_id:      Optional[str] = Form(None),
+    acl_company_id:    Optional[str] = Form(None),
+    acl_department_id: Optional[str] = Form(None),
+    acl_user_id:       Optional[str] = Form(None),
 ):
     """
-    🔥 UNIFIED API: Process + Embed + Upload MinIO + Store URL
-
-    Steps:
-    1. Process document to markdown
-    2. Create embeddings with smart chunking
-    3. Upload original file to MinIO
-    4. Store URL in document_urls collection
-
-    Args:
-        file: Document file (PDF, DOCX, XLSX, TXT)
-        document_id: Optional custom document ID
-        chunk_mode: Chunking mode (smart|sentence|legacy)
-
-    Returns:
-        Complete processing result with public URL
+    Unified: Process → Embed → Upload MinIO → Store URL
+    Now requires user_id; ACL is derived from user_groups unless overridden.
     """
-
     temp_file_path = None
-
     try:
-        # ============================================================
-        # VALIDATION
-        # ============================================================
-
+        # ── Validate file ────────────────────────────────────────────────────
         if not file.filename:
-            raise HTTPException(status_code=400, detail="No file provided")
+            raise HTTPException(400, "No file provided")
 
-        allowed_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt']
+        allowed = [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt"]
         original_filename = file.filename
-        file_extension = os.path.splitext(original_filename)[1].lower()
+        file_ext = os.path.splitext(original_filename)[1].lower()
+        if file_ext not in allowed:
+            raise HTTPException(400, f"File type {file_ext} not supported")
 
-        if file_extension not in allowed_extensions:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File type {file_extension} not supported. Allowed: {allowed_extensions}"
-            )
+        if chunk_mode not in ["smart", "sentence", "legacy"]:
+            raise HTTPException(400, "chunk_mode must be smart|sentence|legacy")
 
-        # Validate chunk_mode
-        valid_modes = ["smart", "sentence", "legacy"]
-        if chunk_mode not in valid_modes:
-            raise HTTPException(
-                status_code=400,
-                detail=f"chunk_mode must be one of: {valid_modes}"
-            )
-
-        # Generate or sanitize document_id
+        # ── Resolve document_id ──────────────────────────────────────────────
         if document_id:
             document_id = sanitize_id(document_id)
         else:
-            # Use filename without extension as document_id
             document_id = sanitize_id(os.path.splitext(original_filename)[0])
-
         if not document_id:
             document_id = f"doc_{str(uuid.uuid4())[:8]}"
 
-        logger.info(f"📄 Processing: {original_filename} -> {document_id}")
+        # ── Resolve ACL from user_groups ────────────────────────────────────
+        acl: dict = {}
+        uploader = user_id or ""
 
-        # ============================================================
-        # STEP 1: SAVE TEMPORARY FILE
-        # ============================================================
+        if user_id:
+            perms = user_mgr.get_user_permissions(user_id)
+            if perms:
+                acl = {
+                    "group_id":      acl_group_id      or perms.get("group_id",      ""),
+                    "company_id":    acl_company_id    or perms.get("company_id",    ""),
+                    "department_id": acl_department_id or perms.get("department_id", ""),
+                    "user_id":       acl_user_id       or "",   # leave empty = dept-wide by default
+                }
+            else:
+                logger.warning(f"user_id '{user_id}' not in user_groups, using empty ACL")
+        else:
+            # No user_id → public document (no ACL restriction)
+            acl = {
+                "group_id": acl_group_id or "", "company_id": acl_company_id or "",
+                "department_id": acl_department_id or "", "user_id": acl_user_id or "",
+            }
 
-        safe_temp_name = get_safe_temp_filename(original_filename)
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, safe_temp_name)
+        logger.info(f"📄 Processing: {original_filename} | doc_id={document_id} | user={user_id} | ACL={acl}")
 
+        # ── [1] Save temp file ───────────────────────────────────────────────
+        temp_file_path = os.path.join(tempfile.gettempdir(), f"tmp_{uuid.uuid4().hex[:8]}{file_ext}")
         content = await file.read()
-
         if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            raise HTTPException(400, "Uploaded file is empty")
+        with open(temp_file_path, "wb") as f:
+            f.write(content)
 
-        with open(temp_file_path, 'wb') as temp_file:
-            temp_file.write(content)
-
-        logger.info(f"✅ [1/4] Saved temporary file")
-
-        # ============================================================
-        # STEP 2: PROCESS DOCUMENT TO MARKDOWN
-        # ============================================================
-
-        logger.info(f"📝 [2/4] Processing document...")
-
-        if file_extension == '.pdf':
+        # ── [2] Process document ─────────────────────────────────────────────
+        if file_ext == ".pdf":
             markdown_content = doc_processor.process_pdf(temp_file_path)
-        elif file_extension in ['.doc', '.docx']:
+        elif file_ext in [".doc", ".docx"]:
             markdown_content = doc_processor.process_word(temp_file_path)
-        elif file_extension in ['.xls', '.xlsx']:
+        elif file_ext in [".xls", ".xlsx"]:
             markdown_content = doc_processor.process_excel(temp_file_path)
-        elif file_extension == '.txt':
+        else:
             text_content = None
-            for encoding in ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']:
+            for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
                 try:
-                    with open(temp_file_path, 'r', encoding=encoding) as f:
+                    with open(temp_file_path, "r", encoding=enc) as f:
                         text_content = f.read()
                     break
                 except UnicodeDecodeError:
                     continue
-
             if text_content is None:
-                raise HTTPException(status_code=400, detail="Could not decode text file")
-
+                raise HTTPException(400, "Could not decode text file")
             markdown_content = doc_processor.process_text(text_content)
 
-        if not markdown_content or len(markdown_content.strip()) == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract content from file"
-            )
+        if not markdown_content or not markdown_content.strip():
+            raise HTTPException(422, "Could not extract content")
 
-        logger.info(f"✅ [2/4] Document processed: {len(markdown_content)} chars")
-
-        # ============================================================
-        # STEP 3: CREATE EMBEDDINGS WITH SMART CHUNKING
-        # ============================================================
-
-        logger.info(f"🔗 [3/4] Creating embeddings (mode: {chunk_mode})...")
-
-        # Parse markdown to chunks
+        # ── [3] Chunk + Embed ────────────────────────────────────────────────
         if chunk_mode == "smart":
             chunks = doc_processor.parse_markdown_to_chunks(markdown_content, filename=original_filename)
-        elif chunk_mode == "sentence":
-            if hasattr(doc_processor, 'parse_markdown_to_sentences'):
-                chunks = doc_processor.parse_markdown_to_sentences(markdown_content)
-            else:
-                logger.warning("⚠️ sentence mode not available, using smart")
-                chunks = doc_processor.parse_markdown_to_chunks(markdown_content, filename=original_filename)
-        else:  # legacy
-            if hasattr(doc_processor, 'parse_markdown_to_sentences'):
-                chunks = doc_processor.parse_markdown_to_sentences(markdown_content)
-            else:
-                chunks = doc_processor.parse_markdown_to_chunks(markdown_content, filename=original_filename)
+        else:
+            chunks = doc_processor.parse_markdown_to_chunks(markdown_content, filename=original_filename)
 
         if not chunks:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not parse markdown into chunks"
-            )
+            raise HTTPException(422, "Could not parse markdown into chunks")
 
-        logger.info(f"✅ Created {len(chunks)} chunks")
-
-        # Generate embeddings
         embeddings_data = []
-        successful_embeddings = 0
-
         for i, chunk in enumerate(chunks):
-            try:
-                embedding = embedding_service.get_embedding(chunk['content'])
-
-                metadata = {
-                    "section_title": chunk.get('section_title', 'Unknown Section'),
-                    "chunk_index": i,
-                    "content_length": len(chunk['content']),
-                    "chunk_mode": chunk_mode
-                }
-
-                if chunk_mode == "smart":
-                    metadata.update({
-                        "token_count": chunk.get('token_count', 0),
-                        "chunk_type": chunk.get('chunk_type', 'unknown'),
-                        "context": chunk.get('context', ''),
-                        "level": chunk.get('level', 0)
-                    })
-
-                    if 'context_path' in chunk:
-                        metadata["context_path"] = " > ".join(chunk['context_path'])
-
-                embedding_data = {
-                    "id": f"{document_id}_{chunk_mode}_{i}",
-                    "document_id": document_id,
-                    "description": chunk['content'],
-                    "description_vector": embedding,
-                    "metadata": metadata
-                }
-
-                embeddings_data.append(embedding_data)
-                successful_embeddings += 1
-
-            except Exception as e:
-                logger.error(f"❌ Embedding error for chunk {i}: {e}")
-                continue
+            embedding = embedding_svc.get_embedding(chunk["content"])
+            embeddings_data.append({
+                "id":          f"{document_id}_{chunk_mode}_{i}",
+                "document_id": document_id,
+                "description": chunk["content"],
+                "description_vector": embedding,
+            })
 
         if not embeddings_data:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not create embeddings for any chunks"
-            )
+            raise HTTPException(422, "Could not create embeddings")
 
-        # Store embeddings in Milvus
-        stored_count = await milvus_manager.insert_embeddings(embeddings_data)
-
-        logger.info(f"✅ [3/4] Embeddings stored: {stored_count} vectors")
-
-        # ============================================================
-        # STEP 4: UPLOAD TO MINIO & STORE URL
-        # ============================================================
-
-        logger.info(f"📤 [4/4] Uploading to MinIO...")
-
-        # Upload file - returns PUBLIC URL
-        public_url = upload_to_minio(temp_file_path, document_id)
-
-        # Store URL in document_urls collection
-        safe_filename = sanitize_filename(original_filename)
-
-        url_stored = milvus_manager.insert_url(
-            document_id=document_id,
-            url=public_url,
-            filename=safe_filename,
-            file_type=file_extension
+        stored = await milvus_manager.insert_embeddings(
+            embeddings_data, acl=acl, uploaded_by=uploader
         )
 
-        if not url_stored:
-            logger.warning("⚠️ URL storage failed but continuing...")
-
-        logger.info(f"✅ [4/4] File uploaded and URL stored")
-
-        # ============================================================
-        # PREPARE RESPONSE
-        # ============================================================
+        # ── [4] Upload MinIO + Store URL ─────────────────────────────────────
+        public_url   = upload_to_minio(temp_file_path, document_id)
+        safe_fname   = sanitize_filename(original_filename)
+        url_stored   = milvus_manager.insert_url(document_id, public_url, safe_fname, file_ext)
 
         return {
-            "status": "success",
+            "status":  "success",
             "message": "Document processed, embedded, and uploaded successfully",
             "document_info": {
-                "document_id": document_id,
+                "document_id":       document_id,
                 "original_filename": original_filename,
-                "safe_filename": safe_filename,
-                "file_type": file_extension,
-                "file_size_bytes": len(content)
+                "file_type":         file_ext,
+                "file_size_bytes":   len(content),
+                "uploaded_by":       uploader,
             },
+            "acl": acl,
             "processing_stats": {
-                "markdown_length": len(markdown_content),
-                "total_chunks": len(chunks),
-                "successful_embeddings": successful_embeddings,
-                "stored_embeddings": stored_count,
-                "chunk_mode": chunk_mode,
-                "processor": "docling+smart_chunker"
+                "markdown_length":      len(markdown_content),
+                "total_chunks":         len(chunks),
+                "successful_embeddings": len(embeddings_data),
+                "stored_embeddings":    stored,
             },
             "storage": {
-                "public_url": public_url,
-                "storage_provider": "minio",
-                "bucket": minio_bucket,
+                "public_url":           public_url,
                 "url_stored_in_milvus": url_stored,
-                "note": "URL is accessible from browser"
-            }
+            },
         }
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"❌ Processing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-
+        raise HTTPException(500, f"Processing error: {e}")
     finally:
-        # Cleanup temporary file
         try:
             if temp_file_path and os.path.exists(temp_file_path):
                 os.unlink(temp_file_path)
-                logger.debug(f"🗑️ Cleaned up: {temp_file_path}")
-        except Exception as cleanup_error:
-            logger.warning(f"⚠️ Cleanup warning: {cleanup_error}")
+        except Exception:
+            pass
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FAQ / DOCUMENT DELETE  (unchanged logic, kept minimal)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/v1/faq/add")
 async def add_faq(request: dict):
-    """
-    Add FAQ - Thêm câu hỏi và câu trả lời FAQ
-    """
-    try:
-        question = request.get("question", "").strip()
-        answer = request.get("answer", "").strip()
-        faq_id = request.get("faq_id", "").strip()
-
-        if not question:
-            raise HTTPException(status_code=400, detail="Question is required")
-        if not answer:
-            raise HTTPException(status_code=400, detail="Answer is required")
-
-        if not faq_id:
-            faq_id = f"faq_{str(uuid.uuid4())[:8]}"
-        else:
-            faq_id = sanitize_id(faq_id)
-
-        question_embedding = embedding_service.get_embedding(question)
-        success = await milvus_manager.insert_faq(
-            faq_id, question, answer, question_embedding
-        )
-
-        return {
-            "status": "success",
-            "faq_id": faq_id,
-            "question": question,
-            "answer": answer,
-            "message": "FAQ added successfully"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Add FAQ error: {str(e)}")
+    question = (request.get("question") or "").strip()
+    answer   = (request.get("answer")   or "").strip()
+    faq_id   = sanitize_id(request.get("faq_id") or f"faq_{str(uuid.uuid4())[:8]}")
+    if not question: raise HTTPException(400, "question required")
+    if not answer:   raise HTTPException(400, "answer required")
+    vec  = embedding_svc.get_embedding(question)
+    await milvus_manager.insert_faq(faq_id, question, answer, vec)
+    return {"status": "success", "faq_id": faq_id}
 
 
 @app.delete("/api/v1/faq/delete/{faq_id}")
 async def delete_faq(faq_id: str):
-    """Delete FAQ by ID"""
-    try:
-        if not faq_id or not faq_id.strip():
-            raise HTTPException(status_code=400, detail="FAQ ID is required")
-
-        faq_id = faq_id.strip()
-        success = await milvus_manager.delete_faq(faq_id)
-
-        return {
-            "status": "success",
-            "faq_id": faq_id,
-            "message": "FAQ deleted successfully"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete FAQ error: {str(e)}")
+    await milvus_manager.delete_faq(faq_id.strip())
+    return {"status": "success", "faq_id": faq_id}
 
 
 @app.delete("/api/v1/document/delete/{document_id}")
 async def delete_document(document_id: str):
-    """
-    Delete document - Xóa embeddings + URL
-    """
-    try:
-        if not document_id or not document_id.strip():
-            raise HTTPException(status_code=400, detail="Document ID is required")
+    await milvus_manager.delete_document(document_id.strip())
+    milvus_manager.delete_url(document_id.strip())
+    return {"status": "success", "document_id": document_id}
 
-        document_id = document_id.strip()
-
-        # Delete embeddings
-        success = await milvus_manager.delete_document(document_id)
-
-        # Delete URL
-        milvus_manager.delete_url(document_id)
-
-        return {
-            "status": "success",
-            "document_id": document_id,
-            "message": "Document embeddings and URL deleted successfully"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete document error: {str(e)}")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Health check endpoint"""
+    milvus_ok = await milvus_manager.health_check()
+    emb_ok    = embedding_svc.is_ready()
+    minio_ok  = False
     try:
-        milvus_status = await milvus_manager.health_check()
-        embedding_status = embedding_service.is_ready()
-
-        # Check MinIO
-        minio_status = False
-        try:
-            minio_client.bucket_exists(minio_bucket)
-            minio_status = True
-        except:
-            pass
-
-        return {
-            "status": "healthy",
-            "service": "unified-document-api",
-            "version": "3.0.0",
-            "port": 8000,
-            "services": {
-                "milvus": milvus_status,
-                "embedding_model": embedding_status,
-                "minio": minio_status,
-                "document_processor": "ready",
-                "smart_chunking": "enabled"
-            },
-            "environment": {
-                "milvus_host": os.getenv('MILVUS_HOST', 'milvus'),
-                "milvus_port": os.getenv('MILVUS_PORT', '19530'),
-                "minio_internal_endpoint": minio_internal_endpoint,
-                "minio_public_endpoint": minio_public_endpoint,
-                "minio_bucket": minio_bucket
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "service": "unified-document-api",
-            "port": 8000,
-            "error": str(e)
-        }
+        minio_client.bucket_exists(minio_bucket)
+        minio_ok = True
+    except Exception:
+        pass
+    return {
+        "status":  "healthy" if (milvus_ok and emb_ok and minio_ok) else "degraded",
+        "version": "4.0.0",
+        "services": {
+            "milvus":            milvus_ok,
+            "embedding_model":   emb_ok,
+            "minio":             minio_ok,
+            "user_groups":       True,
+        },
+    }
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
