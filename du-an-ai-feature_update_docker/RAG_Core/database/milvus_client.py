@@ -1,52 +1,118 @@
+# RAG_Core/database/milvus_client.py  (UPDATED v2 – user_groups removed, user_db support)
+"""
+MilvusClient cho RAG_Core.
+
+Thay đổi so với v1:
+  - XÓA toàn bộ user_groups collection và các method liên quan:
+      create_user_groups_collection(), get_user(), update_token_cost()
+  - THÊM _get_user_db_manager() để proxy sang user_db (Milvus database "user_db")
+    khi cần lấy thông tin user (VD: check_database_connection trả về user_db status)
+  - Chỉ quản lý 2 collections trong default db:
+      • document_embeddings
+      • faq_embeddings
+  - document_urls được quản lý bởi document_url_service (không thay đổi)
+"""
+
 from pymilvus import connections, Collection, utility, db
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
-from config.settings import settings
 import logging
 import time
+import os
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# USER DB MANAGER  (lazy – proxy sang user_db)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_user_db_manager = None
+
+
+def _get_user_db_manager():
+    """
+    Lazy-init singleton UserDBManager.
+    UserDBManager kết nối tới Milvus database "user_db" (tách biệt với default db).
+    """
+    global _user_db_manager
+    if _user_db_manager is None:
+        try:
+            import sys
+            # Thêm path tới Embedding_vectorDB để import user_db_manager
+            embedding_path = os.path.join(
+                os.path.dirname(__file__), "..", "..", "Embedding_vectorDB"
+            )
+            abs_path = os.path.abspath(embedding_path)
+            if abs_path not in sys.path:
+                sys.path.insert(0, abs_path)
+
+            from user_db_manager import get_user_db_manager
+            _user_db_manager = get_user_db_manager(
+                host=settings.MILVUS_HOST,
+                port=settings.MILVUS_PORT,
+            )
+            logger.info("✅ UserDBManager ready (user_db)")
+        except Exception as e:
+            logger.warning(f"UserDBManager not available: {e}. User features disabled.")
+    return _user_db_manager
+
+
 class MilvusClient:
+    """
+    Quản lý kết nối và search trong Milvus default database.
+
+    Collections được quản lý:
+        default db
+        ├── document_embeddings
+        └── faq_embeddings
+
+    KHÔNG quản lý:
+        user_db.user_groups  → UserDBManager (user_db_manager.py)
+        default.document_urls → DocumentURLService
+    """
+
     def __init__(self):
         self.connected = False
         self.expected_dimension = None
-        self.collections_cache = {}
+        self.collections_cache: Dict[str, Collection] = {}
         self._connect()
 
-    def _connect(self):
-        """Connect to Milvus with retry"""
-        max_retries = 3
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONNECTION
+    # ─────────────────────────────────────────────────────────────────────────
 
+    def _connect(self):
+        """Kết nối tới Milvus default database với retry."""
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Disconnect existing
                 try:
                     connections.disconnect("default")
-                except:
+                except Exception:
                     pass
 
-                # Connect
                 connections.connect(
                     alias="default",
                     host=settings.MILVUS_HOST,
                     port=settings.MILVUS_PORT,
-                    timeout=10
+                    timeout=10,
+                )
+                logger.info(
+                    f"✅ Connected to Milvus: {settings.MILVUS_HOST}:{settings.MILVUS_PORT}"
                 )
 
-                logger.info(f"✅ Connected to Milvus: {settings.MILVUS_HOST}:{settings.MILVUS_PORT}")
-
-                # Switch to default database
+                # Đảm bảo dùng default database cho document/faq collections
                 try:
                     db.using_database("default")
-                    logger.info(f"✅ Using database: default")
+                    logger.info("✅ Using database: default")
                 except Exception as db_err:
                     logger.warning(f"Could not switch database: {db_err}")
 
                 self.connected = True
 
-                # Load collections (but don't fail if this errors)
                 try:
                     self._load_collections()
                 except Exception as load_err:
@@ -63,170 +129,187 @@ class MilvusClient:
                     self.connected = False
 
     def _load_collections(self):
-        """Load collections with error handling"""
+        """Load document và faq collections (không load user_groups)."""
         try:
-            available_collections = utility.list_collections()
-            logger.info(f"📚 Available collections: {available_collections}")
+            available = utility.list_collections()
+            logger.info(f"📚 Available collections (default db): {available}")
 
-            # Load document collection
-            if settings.DOCUMENT_COLLECTION in available_collections:
-                try:
-                    collection = Collection(settings.DOCUMENT_COLLECTION)
-                    collection.load()
-                    self.collections_cache[settings.DOCUMENT_COLLECTION] = collection
-                    logger.info(f"✅ Loaded: {settings.DOCUMENT_COLLECTION} ({collection.num_entities} entities)")
-                except Exception as e:
-                    logger.warning(f"Could not load {settings.DOCUMENT_COLLECTION}: {e}")
-
-            # Load FAQ collection
-            if settings.FAQ_COLLECTION in available_collections:
-                try:
-                    collection = Collection(settings.FAQ_COLLECTION)
-                    collection.load()
-                    self.collections_cache[settings.FAQ_COLLECTION] = collection
-                    logger.info(f"✅ Loaded: {settings.FAQ_COLLECTION} ({collection.num_entities} entities)")
-                except Exception as e:
-                    logger.warning(f"Could not load {settings.FAQ_COLLECTION}: {e}")
+            for col_name in [settings.DOCUMENT_COLLECTION, settings.FAQ_COLLECTION]:
+                if col_name in available:
+                    try:
+                        col = Collection(col_name)
+                        col.load()
+                        self.collections_cache[col_name] = col
+                        logger.info(f"✅ Loaded: {col_name} ({col.num_entities} entities)")
+                    except Exception as e:
+                        logger.warning(f"Could not load {col_name}: {e}")
 
         except Exception as e:
             logger.error(f"Error loading collections: {e}")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # CONNECTION CHECK
+    # ─────────────────────────────────────────────────────────────────────────
+
     def check_connection(self) -> bool:
-        """Check if connected - simplified version"""
+        """Kiểm tra kết nối Milvus default db."""
         if not self.connected:
             return False
-
         try:
-            # Simple ping
             utility.list_collections(timeout=2)
             return True
-        except:
-            # Connection lost, try to reconnect
-            logger.warning("Connection lost, reconnecting...")
+        except Exception:
+            logger.warning("Connection lost, reconnecting…")
             self._connect()
             return self.connected
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # COLLECTION ACCESS
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _get_collection(self, collection_name: str) -> Collection:
-        """Get collection with lazy loading"""
-        # Check cache first
+        """Lấy collection với lazy loading và cache."""
         if collection_name in self.collections_cache:
-            collection = self.collections_cache[collection_name]
-            # Verify collection is still valid
+            col = self.collections_cache[collection_name]
             try:
-                _ = collection.num_entities
-                return collection
-            except:
-                # Cache is stale, reload
-                logger.warning(f"Cached collection {collection_name} is stale, reloading...")
+                _ = col.num_entities
+                return col
+            except Exception:
+                logger.warning(f"Cached collection {collection_name} stale, reloading…")
                 del self.collections_cache[collection_name]
 
-        # Load collection
         try:
             if not utility.has_collection(collection_name):
                 raise ValueError(f"Collection '{collection_name}' does not exist")
-
-            collection = Collection(collection_name)
-            collection.load()
-            self.collections_cache[collection_name] = collection
+            col = Collection(collection_name)
+            col.load()
+            self.collections_cache[collection_name] = col
             logger.info(f"✅ Loaded collection: {collection_name}")
-            return collection
-
+            return col
         except Exception as e:
             logger.error(f"Failed to load collection {collection_name}: {e}")
             raise
 
-    def _get_collection_dimension(self, collection_name: str, vector_field: str) -> int:
-        """Get dimension with error handling"""
+    def _get_collection_dimension(
+        self, collection_name: str, vector_field: str
+    ) -> int:
         try:
-            collection = self._get_collection(collection_name)
-            schema = collection.schema
+            col    = self._get_collection(collection_name)
+            schema = col.schema
             for field in schema.fields:
                 if field.name == vector_field:
-                    dim = field.params.get('dim', 0)
-                    logger.debug(f"Collection {collection_name}.{vector_field} dimension: {dim}")
-                    return dim
+                    return field.params.get("dim", 0)
             logger.warning(f"Vector field {vector_field} not found in {collection_name}")
             return 0
         except Exception as e:
-            logger.error(f"Error getting dimension: {str(e)}")
+            logger.error(f"Error getting dimension: {e}")
             return 0
 
-    def _validate_vector_dimension(self, vector: np.ndarray, collection_name: str, vector_field: str,
-                                   auto_fix: bool = True) -> np.ndarray:
-        """Validate and adjust vector dimension"""
+    def _validate_vector_dimension(
+        self,
+        vector: np.ndarray,
+        collection_name: str,
+        vector_field: str,
+        auto_fix: bool = True,
+    ) -> np.ndarray:
         expected_dim = self._get_collection_dimension(collection_name, vector_field)
-        actual_dim = vector.shape[0] if vector.ndim == 1 else vector.shape[1]
-
+        actual_dim   = vector.shape[0] if vector.ndim == 1 else vector.shape[1]
         if expected_dim == 0:
-            logger.warning(f"Could not determine dimension, using vector as-is")
             return vector
-
         if actual_dim != expected_dim:
             if auto_fix:
-                logger.warning(f"Dimension mismatch: expected {expected_dim}, got {actual_dim}. Auto-fixing...")
+                logger.warning(
+                    f"Dimension mismatch: expected {expected_dim}, got {actual_dim}. Auto-fixing…"
+                )
                 return self._adjust_vector_dimension(vector, expected_dim)
-            else:
-                raise ValueError(f"Dimension mismatch: expected {expected_dim}, got {actual_dim}")
-
+            raise ValueError(f"Dimension mismatch: expected {expected_dim}, got {actual_dim}")
         return vector
 
     def _adjust_vector_dimension(self, vector: np.ndarray, target_dim: int) -> np.ndarray:
-        """Adjust vector dimension"""
         if vector.ndim > 1:
-            current_dim = vector.shape[1]
-            if current_dim < target_dim:
-                padding = np.zeros((vector.shape[0], target_dim - current_dim), dtype=vector.dtype)
-                return np.concatenate([vector, padding], axis=1)
-            elif current_dim > target_dim:
-                return vector[:, :target_dim]
-        else:
-            current_dim = vector.shape[0]
-            if current_dim < target_dim:
-                padding = np.zeros(target_dim - current_dim, dtype=vector.dtype)
-                return np.concatenate([vector, padding])
-            elif current_dim > target_dim:
-                return vector[:target_dim]
-        return vector
+            cur = vector.shape[1]
+            if cur < target_dim:
+                return np.concatenate(
+                    [vector, np.zeros((vector.shape[0], target_dim - cur), dtype=vector.dtype)],
+                    axis=1,
+                )
+            return vector[:, :target_dim]
+        cur = vector.shape[0]
+        if cur < target_dim:
+            return np.concatenate([vector, np.zeros(target_dim - cur, dtype=vector.dtype)])
+        return vector[:target_dim]
 
-    def search_documents(self, query_vector: np.ndarray, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Search documents with retry logic"""
+    # ─────────────────────────────────────────────────────────────────────────
+    # SEARCH – DOCUMENT EMBEDDINGS (default db)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def search_documents(
+        self, query_vector: np.ndarray, top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Search document_embeddings (không có ACL filter)."""
+        return self._search_documents_internal(query_vector, top_k, acl_expr=None)
+
+    def search_documents_with_acl(
+        self,
+        query_vector: np.ndarray,
+        top_k: int = 5,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search document_embeddings với ACL filter.
+        ACL permissions lấy từ user_db.user_groups qua UserDBManager.
+        """
+        acl_expr = None
+        if user_id:
+            mgr = _get_user_db_manager()
+            if mgr:
+                acl_expr = mgr.build_acl_expression(user_id)
+                if acl_expr:
+                    logger.info(f"🔒 ACL filter (user_db): {acl_expr[:100]}")
+                else:
+                    logger.info(f"🔓 No ACL restrictions for user_id={user_id}")
+            else:
+                logger.warning("UserDBManager unavailable, running open search")
+
+        return self._search_documents_internal(query_vector, top_k, acl_expr=acl_expr)
+
+    def _search_documents_internal(
+        self,
+        query_vector: np.ndarray,
+        top_k: int,
+        acl_expr: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Thực hiện search với retry logic."""
         max_retries = 2
-
         for attempt in range(max_retries):
             try:
-                # Check connection
                 if not self.check_connection():
                     raise ConnectionError("Not connected to Milvus")
 
-                # Get collection
-                collection = self._get_collection(settings.DOCUMENT_COLLECTION)
-
-                # Validate vector
+                col = self._get_collection(settings.DOCUMENT_COLLECTION)
                 query_vector = self._validate_vector_dimension(
                     query_vector, settings.DOCUMENT_COLLECTION, "description_vector"
                 )
 
-                # Search
-                search_params = {
-                    "metric_type": "COSINE",
-                    "params": {"ef": 64}
-                }
-
-                results = collection.search(
+                search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+                kwargs = dict(
                     data=[query_vector.tolist()],
                     anns_field="description_vector",
                     param=search_params,
                     limit=top_k,
-                    output_fields=["document_id", "description"]
+                    output_fields=["document_id", "description"],
                 )
+                if acl_expr:
+                    kwargs["expr"] = acl_expr
 
+                results   = col.search(**kwargs)
                 documents = []
                 for hits in results:
                     for hit in hits:
                         documents.append({
-                            "document_id": hit.entity.get("document_id"),
-                            "description": hit.entity.get("description"),
-                            "similarity_score": hit.score
+                            "document_id":      hit.entity.get("document_id"),
+                            "description":      hit.entity.get("description"),
+                            "similarity_score": hit.score,
                         })
 
                 logger.info(f"✅ Found {len(documents)} documents")
@@ -235,52 +318,47 @@ class MilvusClient:
             except Exception as e:
                 logger.error(f"Search attempt {attempt + 1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
-                    # Retry: reconnect
                     self._connect()
                     time.sleep(1)
                 else:
                     raise
 
-    def search_faq(self, query_vector: np.ndarray, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Search FAQ with retry logic"""
-        max_retries = 2
+    # ─────────────────────────────────────────────────────────────────────────
+    # SEARCH – FAQ (default db)
+    # ─────────────────────────────────────────────────────────────────────────
 
+    def search_faq(
+        self, query_vector: np.ndarray, top_k: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Search faq_embeddings."""
+        max_retries = 2
         for attempt in range(max_retries):
             try:
-                # Check connection
                 if not self.check_connection():
                     raise ConnectionError("Not connected to Milvus")
 
-                # Get collection
-                collection = self._get_collection(settings.FAQ_COLLECTION)
-
-                # Validate vector
+                col = self._get_collection(settings.FAQ_COLLECTION)
                 query_vector = self._validate_vector_dimension(
                     query_vector, settings.FAQ_COLLECTION, "question_vector"
                 )
 
-                # Search
-                search_params = {
-                    "metric_type": "COSINE",
-                    "params": {"ef": 64}
-                }
-
-                results = collection.search(
+                search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+                results = col.search(
                     data=[query_vector.tolist()],
                     anns_field="question_vector",
                     param=search_params,
                     limit=top_k,
-                    output_fields=["faq_id", "question", "answer"]
+                    output_fields=["faq_id", "question", "answer"],
                 )
 
                 faqs = []
                 for hits in results:
                     for hit in hits:
                         faqs.append({
-                            "faq_id": hit.entity.get("faq_id"),
-                            "question": hit.entity.get("question"),
-                            "answer": hit.entity.get("answer"),
-                            "similarity_score": hit.score
+                            "faq_id":           hit.entity.get("faq_id"),
+                            "question":         hit.entity.get("question"),
+                            "answer":           hit.entity.get("answer"),
+                            "similarity_score": hit.score,
                         })
 
                 logger.info(f"✅ Found {len(faqs)} FAQs")
@@ -289,40 +367,76 @@ class MilvusClient:
             except Exception as e:
                 logger.error(f"FAQ search attempt {attempt + 1}/{max_retries} failed: {e}")
                 if attempt < max_retries - 1:
-                    # Retry: reconnect
                     self._connect()
                     time.sleep(1)
                 else:
                     raise
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # COLLECTION INFO
+    # ─────────────────────────────────────────────────────────────────────────
+
     def get_collection_info(self, collection_name: str) -> Dict[str, Any]:
-        """Get collection info"""
+        """Thông tin collection trong default db."""
         try:
             if not utility.has_collection(collection_name):
                 return {"error": f"Collection {collection_name} does not exist"}
-
-            collection = Collection(collection_name)
-            schema = collection.schema
-
-            fields_info = []
-            for field in schema.fields:
-                field_info = {
-                    "name": field.name,
-                    "dtype": str(field.dtype),
-                    "params": field.params
-                }
-                fields_info.append(field_info)
-
+            col    = Collection(collection_name)
+            schema = col.schema
             return {
                 "collection_name": collection_name,
-                "fields": fields_info,
-                "description": schema.description,
-                "num_entities": collection.num_entities
+                "database":        "default",
+                "fields":          [
+                    {"name": f.name, "dtype": str(f.dtype), "params": f.params}
+                    for f in schema.fields
+                ],
+                "description":  schema.description,
+                "num_entities": col.num_entities,
             }
         except Exception as e:
-            logger.error(f"Error getting collection info: {str(e)}")
             return {"error": str(e)}
 
+    def get_all_stats(self) -> Dict[str, Any]:
+        """
+        Stats cho tất cả databases.
+        default db: document_embeddings, faq_embeddings
+        user_db:    user_groups (via UserDBManager)
+        """
+        stats: Dict[str, Any] = {
+            "default_db": {},
+            "user_db":    {},
+        }
 
-# Global instance
+        # default db stats
+        for col_name in [settings.DOCUMENT_COLLECTION, settings.FAQ_COLLECTION]:
+            try:
+                if utility.has_collection(col_name):
+                    col = Collection(col_name)
+                    stats["default_db"][col_name] = {"count": col.num_entities}
+                else:
+                    stats["default_db"][col_name] = {"count": 0, "exists": False}
+            except Exception as e:
+                stats["default_db"][col_name] = {"error": str(e)}
+
+        # user_db stats (via UserDBManager)
+        try:
+            mgr = _get_user_db_manager()
+            if mgr:
+                info = mgr.get_database_info()
+                stats["user_db"]["user_groups"] = {
+                    "count":    info.get("user_count", "?"),
+                    "database": "user_db",
+                }
+            else:
+                stats["user_db"]["user_groups"] = {"error": "UserDBManager unavailable"}
+        except Exception as e:
+            stats["user_db"]["user_groups"] = {"error": str(e)}
+
+        return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL INSTANCE
+# ─────────────────────────────────────────────────────────────────────────────
+
 milvus_client = MilvusClient()

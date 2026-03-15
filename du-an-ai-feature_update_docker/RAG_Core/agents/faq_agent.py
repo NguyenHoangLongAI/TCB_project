@@ -17,7 +17,7 @@ class FAQAgent:
         self.vector_threshold = 0.5
         self.rerank_threshold = 0.6
 
-        self.llm_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
+        self.llm_prompt = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 Câu hỏi người dùng: "{question}"
 

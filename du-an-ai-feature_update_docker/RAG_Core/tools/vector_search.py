@@ -1,29 +1,35 @@
-# RAG_Core/tools/vector_search.py  (UPDATED – ACL-aware search)
+# RAG_Core/tools/vector_search.py  (OPTIMIZED – truncate docs trước Cohere rerank)
 """
-All tools from the original file are preserved.
-New: search_documents_acl – filters by user permission scope.
-The existing search_documents tool now delegates to ACL search when user_id is set.
+Thay đổi:
+  - rerank_documents(): truncate description xuống 512 ký tự trước khi gửi Cohere.
+    Cohere rerank giới hạn ~512 token/doc — gửi full text bị cắt ngẫu nhiên,
+    tốt hơn là tự cắt có kiểm soát (giữ phần đầu chứa context_header).
+  - rerank_faq(): giữ nguyên vì FAQ thường ngắn.
+  - search_documents / search_documents_for_user: không đổi.
 """
 
 from langchain_core.tools import tool
 from typing import List, Dict, Any, Optional
 import numpy as np, os, logging
+
 from models.embedding_model import embedding_model
-from database.milvus_client import milvus_client
+from database.milvus_client import milvus_client, _get_user_db_manager
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COHERE SETUP  (unchanged from original)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── Cohere setup ─────────────────────────────────────────────────────────────
 
-cohere_client = None
+cohere_client       = None
 COHERE_RERANK_MODEL = "rerank-multilingual-v3.0"
 
 try:
     import cohere
-    cohere_api_key = getattr(settings, "COHERE_API_KEY", None) or os.getenv("COHERE_API_KEY") or "NoQ9Jjvz5r1JeRWZG8L9dnl8BxYljmnOdiUfTnfk"
+    cohere_api_key = (
+        getattr(settings, "COHERE_API_KEY", None)
+        or os.getenv("COHERE_API_KEY")
+        or "NoQ9Jjvz5r1JeRWZG8L9dnl8BxYljmnOdiUfTnfk"
+    )
     if cohere_api_key and cohere_api_key != "your-api-key-here":
         cohere_client = cohere.Client(cohere_api_key)
         if hasattr(settings, "COHERE_RERANK_MODEL"):
@@ -32,80 +38,11 @@ try:
 except Exception as e:
     logger.error(f"Cohere init error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ACL HELPER
-# ─────────────────────────────────────────────────────────────────────────────
+# Số ký tự tối đa gửi lên Cohere mỗi document
+# ~512 token × 4 ký tự/token ≈ 2000 ký tự — an toàn cho tiếng Việt
+_COHERE_MAX_CHARS = 2000
 
-def build_acl_expr(permissions: Optional[Dict[str, str]]) -> str:
-    """
-    Build Milvus filter expression from user permission scope.
-
-    Permission logic (4-level hierarchy):
-      - A document is accessible if EVERY non-empty ACL field of the document
-        matches the user's corresponding field, OR the document's ACL field is "".
-
-    Example:
-      user has group=Techcombank_group, company=Techcomlife, dept=Sell_Techcomlife
-      → can see docs where:
-           (acl_group_id == "" OR acl_group_id == "Techcombank_group")
-        AND (acl_company_id == "" OR acl_company_id == "Techcomlife")
-        AND (acl_department_id == "" OR acl_department_id == "Sell_Techcomlife")
-        AND (acl_user_id == "" OR acl_user_id == "<user_id>")
-    """
-    if not permissions:
-        return ""   # no restriction
-
-    clauses = []
-    field_map = {
-        "group_id":      "acl_group_id",
-        "company_id":    "acl_company_id",
-        "department_id": "acl_department_id",
-        "user_id":       "acl_user_id",
-    }
-    for perm_key, milvus_field in field_map.items():
-        val = (permissions.get(perm_key) or "").strip()
-        if val:
-            # doc's field must be blank (public) OR match user's value
-            clauses.append(f'({milvus_field} == "" or {milvus_field} == "{val}")')
-        else:
-            # user has no restriction at this level → only public (blank) docs at this level
-            # OR any value is ok because user is at a higher wildcard level
-            # Wildcard: user's field is empty → match anything at this level
-            pass   # no clause needed when user has wildcard
-
-    return " and ".join(clauses) if clauses else ""
-
-
-def get_user_permissions(user_id: Optional[str]) -> Optional[Dict[str, str]]:
-    """Fetch permission scope from Milvus user_groups collection."""
-    if not user_id:
-        return None
-    try:
-        from pymilvus import Collection, utility
-        if not utility.has_collection("user_groups"):
-            return None
-        col = Collection("user_groups")
-        col.load()
-        rows = col.query(
-            expr=f'user_id == "{user_id}"',
-            output_fields=["group_id", "company_id", "department_id", "user_id"],
-            limit=1,
-        )
-        if rows:
-            r = rows[0]
-            return {
-                "group_id":      r.get("group_id", ""),
-                "company_id":    r.get("company_id", ""),
-                "department_id": r.get("department_id", ""),
-                "user_id":       user_id,
-            }
-    except Exception as e:
-        logger.warning(f"get_user_permissions error for {user_id}: {e}")
-    return None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VECTOR DIMENSION UTILITIES  (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── Vector utilities ─────────────────────────────────────────────────────────
 
 def pad_vector_to_dimension(vector: np.ndarray, target_dim: int) -> np.ndarray:
     current_dim = vector.shape[0] if vector.ndim == 1 else vector.shape[1]
@@ -113,19 +50,20 @@ def pad_vector_to_dimension(vector: np.ndarray, target_dim: int) -> np.ndarray:
         return vector[:target_dim] if vector.ndim == 1 else vector[:, :target_dim]
     if vector.ndim == 1:
         return np.concatenate([vector, np.zeros(target_dim - current_dim, dtype=vector.dtype)])
-    return np.concatenate([vector, np.zeros((vector.shape[0], target_dim - current_dim), dtype=vector.dtype)], axis=1)
+    return np.concatenate(
+        [vector, np.zeros((vector.shape[0], target_dim - current_dim), dtype=vector.dtype)],
+        axis=1,
+    )
 
 
 def safe_encode_and_fix_dimension(query: str, target_collection: str, target_field: str) -> np.ndarray:
-    query_vector  = embedding_model.encode_single(query)
-    expected_dim  = milvus_client._get_collection_dimension(target_collection, target_field)
+    query_vector = embedding_model.encode_single(query)
+    expected_dim = milvus_client._get_collection_dimension(target_collection, target_field)
     if expected_dim > 0 and query_vector.shape[0] != expected_dim:
         query_vector = pad_vector_to_dimension(query_vector, expected_dim)
     return query_vector
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RERANKING TOOLS  (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─── Reranking ────────────────────────────────────────────────────────────────
 
 @tool
 def rerank_faq(query: str, faq_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -133,14 +71,24 @@ def rerank_faq(query: str, faq_results: List[Dict[str, Any]]) -> List[Dict[str, 
     try:
         if not faq_results or cohere_client is None:
             return faq_results
-        documents = [f"Câu hỏi: {f.get('question','')}\nTrả lời: {f.get('answer','')}" for f in faq_results]
-        resp = cohere_client.rerank(query=query, documents=documents, model=COHERE_RERANK_MODEL, top_n=len(documents), return_documents=False)
+        documents = [
+            f"Câu hỏi: {f.get('question','')}\nTrả lời: {f.get('answer','')}"
+            for f in faq_results
+        ]
+        resp = cohere_client.rerank(
+            query=query, documents=documents, model=COHERE_RERANK_MODEL,
+            top_n=len(documents), return_documents=False,
+        )
         reranked = []
         for r in resp.results:
             faq = faq_results[r.index].copy()
             faq["rerank_score"] = float(r.relevance_score)
             reranked.append(faq)
         reranked.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+        logger.info(
+            f"✅ FAQ reranked {len(reranked)} — "
+            f"best={reranked[0].get('rerank_score',0):.4f}"
+        )
         return reranked
     except Exception as e:
         logger.error(f"rerank_faq error: {e}")
@@ -149,76 +97,54 @@ def rerank_faq(query: str, faq_results: List[Dict[str, Any]]) -> List[Dict[str, 
 
 @tool
 def rerank_documents(query: str, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rerank documents using Cohere."""
+    """
+    Rerank documents using Cohere.
+
+    OPT: Truncate description xuống _COHERE_MAX_CHARS trước khi gửi.
+    Cohere giới hạn ~512 token/doc. Gửi full text bị cắt ngẫu nhiên ở cuối —
+    tự truncate có kiểm soát giữ được context_header (phần quan trọng nhất
+    ở đầu mỗi chunk).
+    """
     try:
         if not documents or cohere_client is None:
             return documents
-        texts = [d.get("description", "") or d.get("answer", "") for d in documents]
-        resp  = cohere_client.rerank(query=query, documents=texts, model=COHERE_RERANK_MODEL, top_n=len(texts), return_documents=False)
+
+        texts = [
+            (d.get("description", "") or d.get("answer", ""))[:_COHERE_MAX_CHARS]
+            for d in documents
+        ]
+
+        resp = cohere_client.rerank(
+            query=query, documents=texts, model=COHERE_RERANK_MODEL,
+            top_n=len(texts), return_documents=False,
+        )
         reranked = []
         for r in resp.results:
             doc = documents[r.index].copy()
             doc["rerank_score"] = float(r.relevance_score)
             reranked.append(doc)
         reranked.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-        logger.info(f"✅ Reranked {len(reranked)} docs. Best={reranked[0].get('rerank_score',0):.3f}")
+
+        # Log phân phối score để monitor threshold
+        scores = [d.get("rerank_score", 0) for d in reranked]
+        logger.info(
+            f"✅ Reranked {len(reranked)} docs — "
+            f"best={scores[0]:.4f} p50={scores[len(scores)//2]:.4f} worst={scores[-1]:.4f}"
+        )
         return reranked
     except Exception as e:
         logger.error(f"rerank_documents error: {e}")
         return documents
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ACL-AWARE DOCUMENT SEARCH
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _search_documents_with_acl(query: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Internal helper: search document_embeddings with optional ACL filter.
-    """
-    try:
-        query_vector = safe_encode_and_fix_dimension(query, settings.DOCUMENT_COLLECTION, "description_vector")
-        permissions  = get_user_permissions(user_id)
-        acl_expr     = build_acl_expr(permissions)
-
-        if not milvus_client.check_connection():
-            raise ConnectionError("Not connected to Milvus")
-
-        from pymilvus import Collection
-        collection   = milvus_client._get_collection(settings.DOCUMENT_COLLECTION)
-        search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
-
-        kwargs: dict = dict(
-            data=[query_vector.tolist()],
-            anns_field="description_vector",
-            param=search_params,
-            limit=settings.TOP_K,
-            output_fields=["document_id", "description"],
-        )
-        if acl_expr:
-            kwargs["expr"] = acl_expr
-            logger.info(f"🔒 ACL filter applied: {acl_expr[:120]}")
-
-        results = collection.search(**kwargs)
-        documents = []
-        for hits in results:
-            for hit in hits:
-                documents.append({
-                    "document_id":      hit.entity.get("document_id"),
-                    "description":      hit.entity.get("description"),
-                    "similarity_score": hit.score,
-                })
-        logger.info(f"✅ Found {len(documents)} documents (user_id={user_id})")
-        return documents
-    except Exception as e:
-        logger.error(f"_search_documents_with_acl error: {e}")
-        return []
-
+# ─── Document search ──────────────────────────────────────────────────────────
 
 @tool
 def search_documents(query: str) -> List[Dict[str, Any]]:
-    """Search documents (no ACL – backward compat)."""
+    """Search document_embeddings không có ACL filter."""
     try:
-        query_vector = safe_encode_and_fix_dimension(query, settings.DOCUMENT_COLLECTION, "description_vector")
+        query_vector = safe_encode_and_fix_dimension(
+            query, settings.DOCUMENT_COLLECTION, "description_vector"
+        )
         return milvus_client.search_documents(query_vector, settings.TOP_K)
     except Exception as e:
         logger.error(f"search_documents error: {e}")
@@ -227,30 +153,68 @@ def search_documents(query: str) -> List[Dict[str, Any]]:
 
 @tool
 def search_documents_for_user(query: str, user_id: str) -> List[Dict[str, Any]]:
-    """Search documents filtered by user's ACL permissions."""
-    return _search_documents_with_acl(query, user_id)
+    """Search document_embeddings với ACL filter từ user_db."""
+    try:
+        query_vector = safe_encode_and_fix_dimension(
+            query, settings.DOCUMENT_COLLECTION, "description_vector"
+        )
+        return milvus_client.search_documents_with_acl(
+            query_vector, settings.TOP_K, user_id=user_id
+        )
+    except Exception as e:
+        logger.error(f"search_documents_for_user error: {e}")
+        return [{"error": str(e)}]
 
+# ─── FAQ search ───────────────────────────────────────────────────────────────
 
 @tool
 def search_faq(query: str, top_k: int = None) -> List[Dict[str, Any]]:
-    """Search FAQ collection."""
+    """Search faq_embeddings."""
     try:
         if top_k is None:
             top_k = getattr(settings, "FAQ_TOP_K", 10)
-        query_vector = safe_encode_and_fix_dimension(query, settings.FAQ_COLLECTION, "question_vector")
+        query_vector = safe_encode_and_fix_dimension(
+            query, settings.FAQ_COLLECTION, "question_vector"
+        )
         return milvus_client.search_faq(query_vector, top_k)
     except Exception as e:
         logger.error(f"search_faq error: {e}")
         return [{"error": str(e)}]
 
+# ─── Health check ─────────────────────────────────────────────────────────────
 
 @tool
 def check_database_connection() -> Dict[str, Any]:
-    """Check DB connection."""
+    """Kiểm tra kết nối Milvus default db + user_db + Cohere."""
     try:
-        is_connected = milvus_client.check_connection()
-        result = {"connected": is_connected, "message": "OK" if is_connected else "Disconnected"}
-        result["cohere_reranker"] = {"available": cohere_client is not None, "model": COHERE_RERANK_MODEL if cohere_client else None}
-        return result
+        default_ok   = milvus_client.check_connection()
+        user_db_ok   = False
+        user_db_info = {"available": False}
+        try:
+            mgr = _get_user_db_manager()
+            if mgr:
+                user_db_ok  = mgr.health_check()
+                db_info     = mgr.get_database_info()
+                user_db_info = {
+                    "available":  user_db_ok,
+                    "database":   db_info.get("database", "user_db"),
+                    "user_count": db_info.get("user_count", "?"),
+                }
+        except Exception as ue:
+            user_db_info = {"available": False, "error": str(ue)}
+
+        return {
+            "connected": default_ok,
+            "message":   "OK" if default_ok else "default db disconnected",
+            "default_db": {
+                "connected":   default_ok,
+                "collections": [settings.DOCUMENT_COLLECTION, settings.FAQ_COLLECTION],
+            },
+            "user_db": user_db_info,
+            "cohere_reranker": {
+                "available": cohere_client is not None,
+                "model":     COHERE_RERANK_MODEL if cohere_client else None,
+            },
+        }
     except Exception as e:
         return {"connected": False, "message": str(e)}

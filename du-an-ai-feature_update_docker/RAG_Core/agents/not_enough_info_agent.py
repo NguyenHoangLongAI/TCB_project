@@ -7,7 +7,7 @@ class NotEnoughInfoAgent:
     def __init__(self):
         self.name = "NOT_ENOUGH_INFO"
 
-        self.prompt_template = """Bạn là chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín.
+        self.prompt_template = """Bạn là Tori, chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín.
 
         Câu hỏi: "{question}"
 

@@ -1,4 +1,8 @@
-# RAG_Core/models/llm_model.py  (UPDATED – captures token usage from Ollama)
+# RAG_Core/models/llm_model.py  (FIXED – invoke_with_usage dùng cho Supervisor)
+"""
+Không thay đổi API, chỉ đảm bảo invoke() cũng track được token
+khi cần (dùng invoke_with_usage thay thế).
+"""
 
 from langchain_ollama import OllamaLLM
 from langchain_core.output_parsers import StrOutputParser
@@ -20,22 +24,22 @@ class LLMModel:
             temperature=0.1,
         )
         self.output_parser = StrOutputParser()
-        self.ollama_url    = getattr(settings, "OLLAMA_URL", "http://ollama:11434")
-        self.model_name    = settings.LLM_MODEL
+        self.ollama_url  = getattr(settings, "OLLAMA_URL", "http://ollama:11434")
+        self.model_name  = settings.LLM_MODEL
 
     # ──────────────────────────────────────────────
-    # NON-STREAMING (returns text + token count)
+    # NON-STREAMING
     # ──────────────────────────────────────────────
 
     def invoke(self, prompt: str, **kwargs) -> str:
-        """Non-streaming invoke – returns text only (backward compat)."""
+        """Non-streaming – trả về text only (backward compat)."""
         text, _ = self.invoke_with_usage(prompt, **kwargs)
         return text
 
     def invoke_with_usage(self, prompt: str, **kwargs) -> Tuple[str, int]:
         """
-        Non-streaming invoke that also returns total token count.
-        Returns (answer_text, total_tokens).
+        Non-streaming – trả về (text, total_tokens).
+        Dùng cho: Supervisor, Generator (non-streaming), các agent khác.
         """
         try:
             url = f"{self.ollama_url}/api/generate"
@@ -47,9 +51,12 @@ class LLMModel:
             }
             response = httpx.post(url, json=payload, timeout=120.0)
             response.raise_for_status()
-            data    = response.json()
-            text    = data.get("response", "")
-            tokens  = (data.get("prompt_eval_count", 0) or 0) + (data.get("eval_count", 0) or 0)
+            data   = response.json()
+            text   = data.get("response", "")
+            tokens = (
+                (data.get("prompt_eval_count") or 0)
+                + (data.get("eval_count") or 0)
+            )
             return self.output_parser.parse(text), tokens
         except Exception as e:
             traceback.print_exc()
@@ -60,10 +67,14 @@ class LLMModel:
     # ──────────────────────────────────────────────
 
     def stream(self, prompt: str, **kwargs) -> Iterator[str]:
-        """Sync streaming – yields text chunks."""
         try:
             url = f"{self.ollama_url}/api/generate"
-            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
+            payload = {
+                "model":   self.model_name,
+                "prompt":  prompt,
+                "stream":  True,
+                "options": {"temperature": 0.1},
+            }
             with httpx.stream("POST", url, json=payload, timeout=60.0) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
@@ -80,10 +91,14 @@ class LLMModel:
             yield f"\n\n[Lỗi streaming: {e}]"
 
     async def astream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
-        """Async streaming – yields text chunks (no token tracking mid-stream)."""
         try:
             url = f"{self.ollama_url}/api/generate"
-            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
+            payload = {
+                "model":   self.model_name,
+                "prompt":  prompt,
+                "stream":  True,
+                "options": {"temperature": 0.1},
+            }
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("POST", url, json=payload) as resp:
                     resp.raise_for_status()
@@ -104,13 +119,18 @@ class LLMModel:
 
     async def astream_with_usage(self, prompt: str, **kwargs):
         """
-        Async streaming that also captures final token usage from Ollama.
-        Yields str chunks, then finally yields a dict {'token_usage': N}.
+        Async streaming trả về token usage.
+        Yield str chunks → cuối cùng yield {"__token_usage__": N}.
         """
         total_tokens = 0
         try:
             url = f"{self.ollama_url}/api/generate"
-            payload = {"model": self.model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.1}}
+            payload = {
+                "model":   self.model_name,
+                "prompt":  prompt,
+                "stream":  True,
+                "options": {"temperature": 0.1},
+            }
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("POST", url, json=payload) as resp:
                     resp.raise_for_status()
@@ -122,9 +142,10 @@ class LLMModel:
                                 if chunk:
                                     yield chunk
                                 if d.get("done"):
-                                    prompt_tokens = d.get("prompt_eval_count", 0) or 0
-                                    eval_tokens   = d.get("eval_count", 0)         or 0
-                                    total_tokens  = prompt_tokens + eval_tokens
+                                    total_tokens = (
+                                        (d.get("prompt_eval_count") or 0)
+                                        + (d.get("eval_count") or 0)
+                                    )
                                     break
                             except json.JSONDecodeError:
                                 continue
@@ -132,7 +153,6 @@ class LLMModel:
             logger.error(f"astream_with_usage error: {e}", exc_info=True)
             yield f"\n\n[Lỗi streaming: {e}]"
 
-        # Final sentinel dict with token info
         yield {"__token_usage__": total_tokens}
 
     def create_chain(self, template: str):
@@ -140,5 +160,4 @@ class LLMModel:
         return prompt | self.llm | self.output_parser
 
 
-# Global instance
 llm_model = LLMModel()

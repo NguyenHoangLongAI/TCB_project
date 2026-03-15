@@ -109,7 +109,7 @@ services:
 
   # ================== OLLAMA (GPU) ==================
   ollama:
-    image: ollama/ollama:0.12.0
+    image: ollama/ollama:latest
     container_name: ollama
     pull_policy: always
 
@@ -227,76 +227,7 @@ services:
       retries: 40
       start_period: 180s
     restart: unless-stopped
-  # ================== PERSONALIZATION DOCUMENT API (PORT 8001) ==================
-  personalization-document-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        - CUDA_VERSION=12.1.1
-    image: du-an-ai-personalization:latest
-    pull_policy: never
-    container_name: personalization-document-api
-    working_dir: /app/Embedding_vectorDB
-
-    # GPU configuration
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu, compute, utility]
-
-    environment:
-      - CUDA_VISIBLE_DEVICES=0
-      - NVIDIA_VISIBLE_DEVICES=0
-      - MILVUS_HOST=milvus
-      - MILVUS_PORT=19530
-      - MILVUS_PERSONALIZATION_DATABASE=personalization_db
-      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
-
-      # OCR Configuration
-      - OCR_USE_GPU=false
-      - USE_DOCLING=true
-      - USE_OCR=true
-      - OCR_LANGUAGES=vi,en
-
-      # MinIO Configuration for personalization
-      - MINIO_PERSONALIZATION_BUCKET=personalization-documents
-      - MINIO_INTERNAL_ENDPOINT=minio:9000
-      - MINIO_PUBLIC_ENDPOINT=localhost:9000
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-      - MINIO_SECURE=false
-
-    command: ["uvicorn", "personalization_api_main:app", "--host", "0.0.0.0", "--port", "8001"]
-
-    volumes:
-      - ./uploads:/app/uploads
-      - ./models:/app/models
-      - ./Embedding_vectorDB:/app/Embedding_vectorDB
-
-    ports:
-      - "8001:8001"
-
-    networks:
-      - ai-net
-
-    depends_on:
-      milvus: { condition: service_healthy }
-      minio:  { condition: service_healthy }
-
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',8001))==0 else 1)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 40
-      start_period: 180s
-
-    restart: unless-stopped
-
-  # ================== RAG CORE API ==================
+# ================== RAG CORE API ==================
   rag-api:
     build:
       context: .
@@ -311,14 +242,18 @@ services:
       - LLM_MODEL=gpt-oss:20b
       - NO_PROXY=ollama,localhost,127.0.0.1
       - no_proxy=ollama,localhost,127.0.0.1
+      - EMBEDDING_API_URL=http://document-api:8000
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - USER_DATABASE_NAME=user_db
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8501"]
     ports:
       - "8501:8501"
     networks:
       - ai-net
     depends_on:
-      document-api: { condition: service_started }  # giữ nguyên logic của bạn
-      ollama:       { condition: service_healthy }  # đảm bảo API sẵn sàng
+      document-api: { condition: service_started }
+      ollama:       { condition: service_healthy }
       ollama-init:  { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',8501))==0 else 1)\""]
@@ -327,39 +262,3 @@ services:
       retries: 20
       start_period: 25s
     restart: unless-stopped
-  # ================== PERSONALIZED RAG API (PORT 8502) ==================
-  personalized-rag-api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: du-an-ai-personalized-rag:latest
-    pull_policy: never
-    container_name: personalized-rag-api
-    working_dir: /app/RAG_Core
-    environment:
-      - OLLAMA_URL=http://ollama:11434
-      - OLLAMA_HOST=http://ollama:11434
-      - LLM_MODEL=gpt-oss:20b
-      - MILVUS_HOST=milvus
-      - MILVUS_PORT=19530
-      - NO_PROXY=ollama,localhost,127.0.0.1
-      - no_proxy=ollama,localhost,127.0.0.1
-    command: ["uvicorn", "api.personalized_main:app", "--host", "0.0.0.0", "--port", "8502"]
-    ports:
-      - "8502:8502"
-    networks:
-      - ai-net
-    depends_on:
-      document-api: { condition: service_started }
-      rag-api:      { condition: service_started }
-      ollama:       { condition: service_healthy }
-      ollama-init:  { condition: service_completed_successfully }
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('127.0.0.1',8502))==0 else 1)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
-    restart: unless-stopped
-
-

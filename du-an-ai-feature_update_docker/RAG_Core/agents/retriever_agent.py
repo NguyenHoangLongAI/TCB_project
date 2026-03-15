@@ -1,7 +1,14 @@
-# RAG_Core/agents/retriever_agent.py  (UPDATED – ACL-aware via user_id)
+# RAG_Core/agents/retriever_agent.py  (OPTIMIZED – bỏ similarity filter trước rerank)
+"""
+Thay đổi:
+  - Bỏ bước lọc SIMILARITY_THRESHOLD trước rerank.
+  - Toàn bộ TOP_K=20 docs đi thẳng vào Grader → Cohere rerank quyết định.
+  - Lý do: vietnamese-sbert COSINE score thấp (0.2-0.45) kể cả khi match tốt.
+    Lọc 0.5 sẽ loại bỏ docs đúng trước khi Cohere kịp đánh giá.
+  - Chỉ log để debug, không bỏ docs nào ở bước này.
+"""
 
-from typing import Dict, Any, List, Optional
-from models.llm_model import llm_model
+from typing import Dict, Any, Optional
 from config.settings import settings
 import logging
 
@@ -10,33 +17,32 @@ logger = logging.getLogger(__name__)
 
 class RetrieverAgent:
     def __init__(self):
-        self.name  = "RETRIEVER"
+        self.name = "RETRIEVER"
 
     def process(
         self,
-        question:               str,
+        question:                str,
         contextualized_question: str = "",
-        is_followup:            bool = False,
-        user_id:                Optional[str] = None,   # NEW
+        is_followup:             bool = False,
+        user_id:                 Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        """
-        Search for relevant documents.
-        When user_id is provided, uses ACL-filtered search.
-        """
         try:
-            # Decide which query to use
+            search_query = (
+                contextualized_question or question
+                if (is_followup or contextualized_question)
+                else question
+            )
+
             if is_followup or contextualized_question:
-                search_query = contextualized_question or question
                 logger.info("🔍 Using CONTEXTUALIZED question for vector search")
             else:
-                search_query = question
                 logger.info("🔍 Using ORIGINAL question for vector search")
 
-            # ── ACL-aware search ────────────────────────────────────────────
+            # ACL-aware search
             if user_id:
                 from tools.vector_search import search_documents_for_user
-                logger.info(f"🔒 ACL-filtered search for user_id={user_id}")
+                logger.info(f"🔒 ACL search: user_id={user_id}")
                 search_results = search_documents_for_user.invoke({
                     "query":   search_query,
                     "user_id": user_id,
@@ -49,17 +55,22 @@ class RetrieverAgent:
             if not search_results or "error" in str(search_results):
                 return {"status": "ERROR", "documents": [], "next_agent": "NOT_ENOUGH_INFO"}
 
-            relevant_docs = [
-                doc for doc in search_results
-                if doc.get("similarity_score", 0) > settings.SIMILARITY_THRESHOLD
-            ]
+            # Log phân phối score để monitor, KHÔNG lọc ở đây
+            if search_results:
+                scores = [d.get("similarity_score", 0) for d in search_results]
+                logger.info(
+                    f"📊 Vector scores — count={len(scores)} "
+                    f"max={max(scores):.3f} min={min(scores):.3f} "
+                    f"avg={sum(scores)/len(scores):.3f}"
+                )
 
-            if not relevant_docs:
-                logger.info(f"No docs above threshold {settings.SIMILARITY_THRESHOLD}, passing all to GRADER")
-                return {"status": "NOT_FOUND", "documents": search_results, "next_agent": "GRADER"}
-
-            logger.info(f"✅ Found {len(relevant_docs)} relevant documents")
-            return {"status": "SUCCESS", "documents": relevant_docs, "next_agent": "GRADER"}
+            # Toàn bộ docs đi vào Grader → Cohere rerank quyết định
+            logger.info(f"✅ Passing {len(search_results)} docs to GRADER (no pre-filter)")
+            return {
+                "status":     "SUCCESS",
+                "documents":  search_results,
+                "next_agent": "GRADER",
+            }
 
         except Exception as e:
             logger.error(f"❌ Retriever error: {e}", exc_info=True)

@@ -1,6 +1,8 @@
-# RAG_Core/agents/base_streaming_agent.py
+# RAG_Core/agents/base_agent.py  (FIXED – process() trả về token_usage)
 """
-Base class cho tất cả agents với streaming support
+Fix: StreamingChatterAgent, StreamingOtherAgent, StreamingNotEnoughInfoAgent
+     dùng invoke_with_usage() thay vì invoke() để trả về token count.
+     Thêm "token_usage" vào kết quả process() của cả 3 agent.
 """
 
 from typing import Dict, Any, List, AsyncIterator
@@ -11,73 +13,48 @@ logger = logging.getLogger(__name__)
 
 
 class BaseStreamingAgent:
-    """
-    Base agent với streaming support cho tất cả agents
-    """
-
     def __init__(self, name: str, prompt_template: str):
-        self.name = name
+        self.name            = name
         self.prompt_template = prompt_template
 
     def process(self, **kwargs) -> Dict[str, Any]:
-        """
-        Non-streaming process (compatibility)
-        Subclass override nếu cần logic đặc biệt
-        """
         raise NotImplementedError("Subclass must implement process()")
 
     async def process_streaming(self, **kwargs) -> AsyncIterator[str]:
         """
-        Streaming process - DEFAULT IMPLEMENTATION
-
-        Workflow:
-        1. Format prompt từ kwargs
-        2. Stream từ LLM
-        3. Yield chunks
+        Default streaming implementation.
+        Dùng astream_with_usage để yield text chunks rồi {"__token_usage__": N}.
         """
         try:
-            # Subclass phải implement method này để format prompt
-            prompt = self._format_prompt(**kwargs)
-
-            logger.info(f"🚀 {self.name}: Starting streaming")
-
+            prompt      = self._format_prompt(**kwargs)
             chunk_count = 0
-            async for chunk in llm_model.astream(prompt):
-                if chunk:
+            logger.info(f"🚀 {self.name}: Starting streaming")
+            async for item in llm_model.astream_with_usage(prompt):
+                if isinstance(item, dict) and "__token_usage__" in item:
+                    logger.info(f"✅ {self.name}: {item['__token_usage__']} tokens, {chunk_count} chunks")
+                    yield item   # forward sentinel lên workflow
+                elif isinstance(item, str) and item:
                     chunk_count += 1
-                    logger.debug(f"{self.name} chunk #{chunk_count}: {chunk[:30]}...")
-                    yield chunk
-
-            logger.info(f"✅ {self.name}: Completed {chunk_count} chunks")
-
+                    yield item
         except Exception as e:
             logger.error(f"❌ {self.name} streaming error: {e}", exc_info=True)
             yield f"\n\n[Lỗi {self.name}: {str(e)}]"
+            yield {"__token_usage__": 0}
 
     def _format_prompt(self, **kwargs) -> str:
-        """
-        Format prompt từ template và kwargs
-        Subclass PHẢI override method này
-        """
         raise NotImplementedError("Subclass must implement _format_prompt()")
 
     def _get_fallback_answer(self, **kwargs) -> str:
-        """
-        Fallback answer nếu LLM fail
-        Subclass có thể override
-        """
         return "Xin lỗi, tôi không thể xử lý yêu cầu này lúc này."
 
 
-# ============================================================================
-# STREAMING-ENABLED AGENTS
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# CHATTER
+# ─────────────────────────────────────────────────────────────────────────────
 
 class StreamingChatterAgent(BaseStreamingAgent):
-    """ChatterAgent với streaming thật"""
-
     def __init__(self):
-        prompt_template = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp, chuyên gia xử lý cảm xúc và an ủi khách hàng.
+        prompt_template = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp, chuyên gia xử lý cảm xúc và an ủi khách hàng.
 
 Nhiệm vụ: An ủi, làm dịu cảm xúc tiêu cực của khách hàng và cung cấp thông tin liên hệ hỗ trợ của Techcomlife.
 
@@ -93,55 +70,53 @@ Hướng dẫn:
 5. Giữ thái độ ấm áp, chuyên nghiệp, đúng chuẩn mực của Techcomlife
 
 Trả lời:"""
-
         super().__init__("CHATTER", prompt_template)
-        self.support_phone = None  # Will be set from settings
 
     def _format_prompt(self, question: str, history: List = None, support_phone: str = "", **kwargs) -> str:
         history_text = "\n".join(history) if history else "Không có lịch sử"
-
         return self.prompt_template.format(
             question=question,
             history=history_text,
-            support_phone=support_phone
+            support_phone=support_phone,
         )
 
     def process(self, question: str, history: List = None, **kwargs) -> Dict[str, Any]:
-        """Non-streaming process"""
+        """Non-streaming – trả về token_usage."""
         try:
             from config.settings import settings
-
             prompt = self._format_prompt(
                 question=question,
                 history=history,
-                support_phone=settings.SUPPORT_PHONE
+                support_phone=settings.SUPPORT_PHONE,
             )
-
-            answer = llm_model.invoke(prompt)
-
+            # ✅ dùng invoke_with_usage
+            answer, tokens = llm_model.invoke_with_usage(prompt)
             if not answer or len(answer.strip()) < 10:
                 answer = self._get_fallback_answer()
-
             return {
-                "status": "SUCCESS",
-                "answer": answer,
-                "references": [{"document_id": "support_contact", "type": "SUPPORT"}],
-                "next_agent": "end"
+                "status":      "SUCCESS",
+                "answer":      answer,
+                "references":  [{"document_id": "support_contact", "type": "SUPPORT"}],
+                "next_agent":  "end",
+                "token_usage": tokens,  # ✅
             }
         except Exception as e:
             return {
-                "status": "ERROR",
-                "answer": self._get_fallback_answer(),
-                "references": [],
-                "next_agent": "end"
+                "status":      "ERROR",
+                "answer":      self._get_fallback_answer(),
+                "references":  [],
+                "next_agent":  "end",
+                "token_usage": 0,
             }
 
 
-class StreamingOtherAgent(BaseStreamingAgent):
-    """OtherAgent với streaming thật"""
+# ─────────────────────────────────────────────────────────────────────────────
+# OTHER
+# ─────────────────────────────────────────────────────────────────────────────
 
+class StreamingOtherAgent(BaseStreamingAgent):
     def __init__(self):
-        prompt_template = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp, chuyên xử lý các yêu cầu ngoài phạm vi hỗ trợ.
+        prompt_template = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp, chuyên xử lý các yêu cầu ngoài phạm vi hỗ trợ.
 
 Nhiệm vụ: Thông báo lịch sự khi yêu cầu nằm ngoài phạm vi tư vấn bảo hiểm và dịch vụ Techcomlife, đồng thời hướng dẫn khách hàng.
 
@@ -155,50 +130,42 @@ Hướng dẫn:
 4. Không từ chối một cách thô lỗ
 
 Trả lời:"""
-
         super().__init__("OTHER", prompt_template)
 
     def _format_prompt(self, question: str, support_phone: str = "", **kwargs) -> str:
-        return self.prompt_template.format(
-            question=question,
-            support_phone=support_phone
-        )
+        return self.prompt_template.format(question=question, support_phone=support_phone)
 
     def process(self, question: str, **kwargs) -> Dict[str, Any]:
-        """Non-streaming process"""
         try:
             from config.settings import settings
-
-            prompt = self._format_prompt(
-                question=question,
-                support_phone=settings.SUPPORT_PHONE
-            )
-
-            answer = llm_model.invoke(prompt)
-
+            prompt = self._format_prompt(question=question, support_phone=settings.SUPPORT_PHONE)
+            answer, tokens = llm_model.invoke_with_usage(prompt)
             if not answer or len(answer.strip()) < 10:
                 answer = self._get_fallback_answer()
-
             return {
-                "status": "SUCCESS",
-                "answer": answer,
-                "references": [],
-                "next_agent": "end"
+                "status":      "SUCCESS",
+                "answer":      answer,
+                "references":  [],
+                "next_agent":  "end",
+                "token_usage": tokens,  # ✅
             }
         except Exception as e:
             return {
-                "status": "ERROR",
-                "answer": self._get_fallback_answer(),
-                "references": [],
-                "next_agent": "end"
+                "status":      "ERROR",
+                "answer":      self._get_fallback_answer(),
+                "references":  [],
+                "next_agent":  "end",
+                "token_usage": 0,
             }
 
 
-class StreamingNotEnoughInfoAgent(BaseStreamingAgent):
-    """NotEnoughInfoAgent với streaming thật"""
+# ─────────────────────────────────────────────────────────────────────────────
+# NOT ENOUGH INFO
+# ─────────────────────────────────────────────────────────────────────────────
 
+class StreamingNotEnoughInfoAgent(BaseStreamingAgent):
     def __init__(self):
-        prompt_template = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
+        prompt_template = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 Câu hỏi người dùng: "{question}"
 
@@ -210,37 +177,28 @@ YÊU CẦU BẮT BUỘC:
 - Giữ thái độ lịch sự, chuyên nghiệp
 
 Chỉ trả về nội dung trả lời, không giải thích gì thêm."""
-
         super().__init__("NOT_ENOUGH_INFO", prompt_template)
 
     def _format_prompt(self, question: str, support_phone: str = "", **kwargs) -> str:
-        return self.prompt_template.format(
-            question=question,
-            support_phone=support_phone
-        )
+        return self.prompt_template.format(question=question, support_phone=support_phone)
 
     def process(self, question: str, **kwargs) -> Dict[str, Any]:
-        """Non-streaming process"""
         try:
             from config.settings import settings
-
-            prompt = self._format_prompt(
-                question=question,
-                support_phone=settings.SUPPORT_PHONE
-            )
-
-            answer = llm_model.invoke(prompt)
-
+            prompt = self._format_prompt(question=question, support_phone=settings.SUPPORT_PHONE)
+            answer, tokens = llm_model.invoke_with_usage(prompt)
             return {
-                "status": "SUCCESS",
-                "answer": answer,
-                "references": [{"document_id": "llm_knowledge", "type": "GENERAL_KNOWLEDGE"}],
-                "next_agent": "end"
+                "status":      "SUCCESS",
+                "answer":      answer,
+                "references":  [{"document_id": "llm_knowledge", "type": "GENERAL_KNOWLEDGE"}],
+                "next_agent":  "end",
+                "token_usage": tokens,  # ✅
             }
         except Exception as e:
             return {
-                "status": "ERROR",
-                "answer": self._get_fallback_answer(),
-                "references": [],
-                "next_agent": "end"
+                "status":      "ERROR",
+                "answer":      self._get_fallback_answer(),
+                "references":  [],
+                "next_agent":  "end",
+                "token_usage": 0,
             }

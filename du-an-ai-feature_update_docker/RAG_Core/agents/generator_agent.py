@@ -11,7 +11,7 @@ class GeneratorAgent:
     def __init__(self):
         self.name = "GENERATOR"
 
-        self.standard_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
+        self.standard_prompt = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 Câu hỏi của khách hàng: "{question}"
 
@@ -30,7 +30,7 @@ Yêu cầu trả lời:
 
 Hãy trả lời như đang tư vấn trực tiếp với khách hàng:"""
 
-        self.followup_prompt = """Bạn là một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
+        self.followup_prompt = """Bạn là Tori, một chuyên viên chăm sóc khách hàng của Techcomlife - công ty bảo hiểm nhân thọ uy tín, thân thiện và chuyên nghiệp.
 
 🔍 NGỮ CẢNH CUỘC TRÒ CHUYỆN:
 {context_summary}

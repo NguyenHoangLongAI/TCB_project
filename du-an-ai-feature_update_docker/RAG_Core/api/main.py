@@ -1,4 +1,4 @@
-# RAG_Core/api/main.py  (FIXED – EMBEDDING_API_BASE from env, token tracking all paths)
+# RAG_Core/api/main.py  (FIXED – token tracking timeout + connection error)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="RAG Multi-Agent Chatbot API",
     description="RAG chatbot with streaming, ACL, and token tracking",
-    version="2.3.0",
+    version="3.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -44,33 +44,59 @@ async def startup_event():
         logger.error(f"⚠️  RAG Workflow init failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOKEN TRACKING HELPER
+# TOKEN TRACKING
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ✅ FIX: đọc từ env var — khi Docker: http://document-api:8000
-#                           khi local:  http://localhost:8000
-EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_URL", "http://localhost:8000").rstrip("/")
+# Đọc từ env — trong Docker: http://document-api:8000
+# Ngoài Docker: http://localhost:8000
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_URL", "http://document-api:8000").rstrip("/")
 logger.info(f"📡 Token tracking endpoint: {EMBEDDING_API_BASE}")
 
 
 async def track_token_usage(user_id: str, tokens_used: int):
-    """Update cost_llm_tokens for user_id via Embedding API."""
+    """
+    Gửi token usage tới Embedding API.
+    Timeout 15s — flush() Milvus v2.3 có thể mất 2-5s.
+    """
     if not user_id or tokens_used <= 0:
         return
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{EMBEDDING_API_BASE}/user/{user_id}/tokens",
-                json={"tokens_used": tokens_used},
+
+    url     = f"{EMBEDDING_API_BASE}/user/{user_id}/tokens"
+    payload = {"tokens_used": tokens_used}
+    logger.info(f"💰 Tracking tokens: POST {url} payload={payload}")
+
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    logger.info(
+                        f"✅ Token tracked: user={user_id} "
+                        f"+{tokens_used} → total={data.get('total_tokens','?')}"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"⚠️ Token tracking HTTP {resp.status_code}: "
+                        f"user={user_id} body={resp.text[:200]}"
+                    )
+                    return
+        except httpx.ConnectError as e:
+            logger.error(
+                f"❌ Token tracking ConnectError attempt {attempt+1}: {e}\n"
+                f"   → Kiểm tra EMBEDDING_API_URL={EMBEDDING_API_BASE}\n"
+                f"   → Kiểm tra docker network: rag-api và document-api cùng ai-net"
             )
-            if resp.status_code == 200:
-                logger.info(f"💰 Token tracked: user={user_id} tokens={tokens_used}")
-            else:
-                logger.warning(
-                    f"Token tracking non-200: user={user_id} status={resp.status_code} body={resp.text[:200]}"
-                )
-    except Exception as e:
-        logger.warning(f"Token tracking failed for {user_id}: {e}")
+        except httpx.TimeoutException as e:
+            logger.error(f"❌ Token tracking timeout attempt {attempt+1}: {e}")
+        except Exception as e:
+            logger.error(f"❌ Token tracking error attempt {attempt+1}: {e}")
+            return
+
+        if attempt == 0:
+            await asyncio.sleep(1)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -87,7 +113,7 @@ def enrich_references_with_urls(references: List[dict]) -> List[dict]:
 async def generate_streaming_response(
     question: str, history: List, user_id: Optional[str]
 ) -> AsyncIterator[str]:
-    """SSE generator — captures __token_usage__ sentinel from answer_stream."""
+    """SSE generator — captures __token_usage__ sentinel từ answer_stream."""
     try:
         yield f"data: {json.dumps({'type':'start','content':None,'references':None,'status':'processing'})}\n\n"
         await asyncio.sleep(0.01)
@@ -95,13 +121,11 @@ async def generate_streaming_response(
         result        = await rag_workflow.run_with_streaming(question, history, user_id=user_id)
         answer_stream = result.get("answer_stream")
         references    = result.get("references", [])
-
-        total_tokens = 0
+        total_tokens  = 0
 
         if answer_stream:
             async for item in answer_stream:
                 if isinstance(item, dict) and "__token_usage__" in item:
-                    # ✅ Sentinel từ generator/faq — capture tokens
                     total_tokens = item["__token_usage__"]
                     logger.info(f"📊 Streaming captured {total_tokens} tokens (user={user_id})")
                 elif isinstance(item, str) and item:
@@ -110,7 +134,7 @@ async def generate_streaming_response(
 
         # References
         if references:
-            enriched = enrich_references_with_urls(references)
+            enriched    = enrich_references_with_urls(references)
             serial_refs = []
             for ref in enriched:
                 r = {
@@ -127,16 +151,19 @@ async def generate_streaming_response(
                 serial_refs.append(r)
             yield f"data: {json.dumps({'type':'references','content':None,'references':serial_refs,'status':None})}\n\n"
 
-        # ✅ Track tokens AFTER stream completes
+        # Track tokens trong background — không block SSE response
         if total_tokens > 0 and user_id:
-            await track_token_usage(user_id, total_tokens)
+            asyncio.create_task(track_token_usage(user_id, total_tokens))
 
         end_payload = {
-            "type":        "end",
-            "content":     None,
-            "references":  None,
-            "status":      result.get("status", "SUCCESS"),
-            "token_usage": {"total_tokens": total_tokens, "user_id": user_id} if total_tokens else None,
+            "type":       "end",
+            "content":    None,
+            "references": None,
+            "status":     result.get("status", "SUCCESS"),
+            "token_usage": (
+                {"total_tokens": total_tokens, "user_id": user_id}
+                if total_tokens else None
+            ),
         }
         yield f"data: {json.dumps(end_payload)}\n\n"
 
@@ -152,7 +179,7 @@ async def generate_streaming_response(
 async def root():
     return {
         "service":  "RAG Multi-Agent Chatbot API",
-        "version":  "2.3.0",
+        "version":  "3.1.0",
         "token_tracking_endpoint": EMBEDDING_API_BASE,
         "endpoints": {"chat": "/chat", "health": "/health"},
     }
@@ -166,26 +193,24 @@ async def chat(request: ChatRequest):
     user_id = (request.user_id or "").strip() or None
     logger.info(f"📨 question={request.question[:80]} stream={request.stream} user_id={user_id}")
 
-    # ── STREAMING ────────────────────────────────────────────────────────────
     if request.stream:
         return StreamingResponse(
             generate_streaming_response(request.question, request.history, user_id),
             media_type="text/event-stream",
             headers={
-                "Cache-Control":    "no-cache",
-                "Connection":       "keep-alive",
+                "Cache-Control":     "no-cache",
+                "Connection":        "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
 
-    # ── NON-STREAMING ────────────────────────────────────────────────────────
+    # Non-streaming
     result       = rag_workflow.run(request.question, request.history, user_id=user_id)
     token_usage  = result.get("token_usage", {})
     total_tokens = token_usage.get("total_tokens", 0)
 
-    # ✅ Track tokens for non-streaming too
     if total_tokens > 0 and user_id:
-        await track_token_usage(user_id, total_tokens)
+        asyncio.create_task(track_token_usage(user_id, total_tokens))
 
     raw_refs      = result.get("references", [])
     enriched_refs = enrich_references_with_urls(raw_refs)
@@ -205,7 +230,10 @@ async def chat(request: ChatRequest):
         answer=result.get("answer", "Lỗi xử lý câu hỏi"),
         references=references,
         status=result.get("status", "ERROR"),
-        token_usage={"total_tokens": total_tokens, "user_id": user_id} if total_tokens else None,
+        token_usage=(
+            {"total_tokens": total_tokens, "user_id": user_id}
+            if total_tokens else None
+        ),
     )
 
 
@@ -214,12 +242,25 @@ async def health_check():
     try:
         db_ok       = milvus_client.check_connection()
         workflow_ok = rag_workflow is not None
-        if db_ok and workflow_ok:
-            return HealthResponse(status="healthy",  message="Hệ thống hoạt động bình thường", database_connected=True)
-        elif workflow_ok:
-            return HealthResponse(status="degraded", message="Mất kết nối DB",    database_connected=False)
-        else:
-            return HealthResponse(status="unhealthy", message="Hệ thống lỗi",    database_connected=False)
+
+        # Kiểm tra kết nối tới Embedding API
+        embedding_api_ok = False
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                r = await client.get(f"{EMBEDDING_API_BASE}/api/v1/health")
+                embedding_api_ok = r.status_code == 200
+        except Exception:
+            pass
+
+        all_ok  = db_ok and workflow_ok
+        status  = "healthy" if all_ok else ("degraded" if workflow_ok else "unhealthy")
+        message = (
+            "Hệ thống hoạt động bình thường" if all_ok
+            else f"db={db_ok} workflow={workflow_ok} embedding_api={embedding_api_ok}"
+        )
+        return HealthResponse(
+            status=status, message=message, database_connected=db_ok
+        )
     except Exception as e:
         return HealthResponse(status="unhealthy", message=str(e), database_connected=False)
 
@@ -228,17 +269,17 @@ async def health_check():
 async def list_agents():
     return {
         "agents": {
-            "SUPERVISOR":      "Điều phối",
+            "SUPERVISOR":      "Điều phối + context",
             "FAQ":             "Câu hỏi thường gặp",
             "RETRIEVER":       "Tìm kiếm (ACL-filtered)",
-            "GRADER":          "Đánh giá",
-            "GENERATOR":       "Tạo câu trả lời (streaming + token tracking)",
+            "GRADER":          "Đánh giá chất lượng",
+            "GENERATOR":       "Tạo câu trả lời",
             "NOT_ENOUGH_INFO": "Thiếu thông tin",
-            "CHATTER":         "Cảm xúc",
-            "REPORTER":        "Báo cáo",
+            "CHATTER":         "Xử lý cảm xúc",
+            "REPORTER":        "Báo cáo hệ thống",
             "OTHER":           "Ngoài phạm vi",
         },
-        "token_tracking_endpoint": EMBEDDING_API_BASE,
+        "token_tracking": f"POST {EMBEDDING_API_BASE}/user/{{user_id}}/tokens",
         "status": "ready" if rag_workflow else "not_initialized",
     }
 
