@@ -1,11 +1,4 @@
-# RAG_Core/workflow/rag_workflow.py  (UPDATED – user_id propagation + token tracking)
-"""
-Key changes vs original:
-  1. run() and run_with_streaming() accept user_id (Optional[str])
-  2. ChatbotState gains user_id field
-  3. Retriever receives user_id for ACL-filtered search
-  4. Token usage is captured from LLM and returned in result dict
-"""
+# RAG_Core/workflow/rag_workflow.py  (FIXED – token_usage captured in all paths)
 
 from typing import Dict, Any, List, AsyncIterator, Optional
 from langgraph.graph import StateGraph
@@ -28,45 +21,45 @@ logger = logging.getLogger(__name__)
 
 
 class ChatbotState(TypedDict):
-    question:                 str
-    original_question:        str
-    history:                  List[Dict[str, str]]
-    is_followup:              bool
-    context_summary:          str
-    relevant_context:         str
-    current_agent:            str
-    documents:                List[Dict[str, Any]]
-    qualified_documents:      List[Dict[str, Any]]
-    references:               List[Dict[str, Any]]
-    answer:                   str
-    status:                   str
-    iteration_count:          int
+    question:                  str
+    original_question:         str
+    history:                   List[Dict[str, str]]
+    is_followup:               bool
+    context_summary:           str
+    relevant_context:          str
+    current_agent:             str
+    documents:                 List[Dict[str, Any]]
+    qualified_documents:       List[Dict[str, Any]]
+    references:                List[Dict[str, Any]]
+    answer:                    str
+    status:                    str
+    iteration_count:           int
     supervisor_classification: Dict[str, Any]
-    faq_result:               Dict[str, Any]
-    retriever_result:         Dict[str, Any]
-    parallel_mode:            bool
-    streaming_mode:           bool
-    user_id:                  Optional[str]   # NEW
-    token_usage:              Dict[str, Any]  # NEW – {"total_tokens": N}
+    faq_result:                Dict[str, Any]
+    retriever_result:          Dict[str, Any]
+    parallel_mode:             bool
+    streaming_mode:            bool
+    user_id:                   Optional[str]
+    token_usage:               Dict[str, Any]   # {"total_tokens": N}
 
 
 class RAGWorkflow:
     def __init__(self):
-        self.supervisor           = SupervisorAgent()
-        self.faq_agent            = FAQAgent()
-        self.retriever_agent      = RetrieverAgent()
-        self.grader_agent         = GraderAgent()
-        self.generator_agent      = GeneratorAgent()
-        self.reporter_agent       = ReporterAgent()
-        self.chatter_agent        = StreamingChatterAgent()
-        self.other_agent          = StreamingOtherAgent()
+        self.supervisor            = SupervisorAgent()
+        self.faq_agent             = FAQAgent()
+        self.retriever_agent       = RetrieverAgent()
+        self.grader_agent          = GraderAgent()
+        self.generator_agent       = GeneratorAgent()
+        self.reporter_agent        = ReporterAgent()
+        self.chatter_agent         = StreamingChatterAgent()
+        self.other_agent           = StreamingOtherAgent()
         self.not_enough_info_agent = StreamingNotEnoughInfoAgent()
 
-        self.executor  = ThreadPoolExecutor(max_workers=3, thread_name_prefix="RAG-Worker")
-        self.workflow  = self._create_workflow()
+        self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="RAG-Worker")
+        self.workflow = self._create_workflow()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # WORKFLOW GRAPH  (unchanged routing)
+    # WORKFLOW GRAPH
     # ─────────────────────────────────────────────────────────────────────────
 
     def _create_workflow(self):
@@ -82,11 +75,16 @@ class RAGWorkflow:
 
         wf.set_entry_point("parallel_execution")
         wf.add_edge("parallel_execution", "decision_router")
-        wf.add_conditional_edges("decision_router", self._route_after_decision,
-                                 {"GRADER":"grader","CHATTER":"chatter","REPORTER":"reporter","OTHER":"other","end":"__end__"})
-        wf.add_conditional_edges("grader", self._route_next_agent,
-                                 {"GENERATOR":"generator","NOT_ENOUGH_INFO":"not_enough_info"})
-        for node in ["generator","not_enough_info","chatter","reporter","other"]:
+        wf.add_conditional_edges(
+            "decision_router", self._route_after_decision,
+            {"GRADER": "grader", "CHATTER": "chatter", "REPORTER": "reporter",
+             "OTHER": "other", "end": "__end__"},
+        )
+        wf.add_conditional_edges(
+            "grader", self._route_next_agent,
+            {"GENERATOR": "generator", "NOT_ENOUGH_INFO": "not_enough_info"},
+        )
+        for node in ["generator", "not_enough_info", "chatter", "reporter", "other"]:
             wf.add_edge(node, "__end__")
         return wf.compile()
 
@@ -96,29 +94,28 @@ class RAGWorkflow:
 
     def _enrich_references_with_urls(self, references):
         try:
-            if not references:
-                return []
-            return document_url_service.enrich_references_with_urls(references)
+            return document_url_service.enrich_references_with_urls(references) if references else []
         except Exception as e:
             logger.error(f"Enrich refs error: {e}")
             return references
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PARALLEL EXECUTION  (with user_id)
+    # PARALLEL EXECUTION
     # ─────────────────────────────────────────────────────────────────────────
 
     def _parallel_execution_node(self, state: ChatbotState) -> ChatbotState:
-        question      = state["question"]
-        history       = state.get("history", [])
-        skip_faq      = state.get("streaming_mode", False)
-        user_id       = state.get("user_id")
+        question     = state["question"]
+        history      = state.get("history", [])
+        skip_faq     = state.get("streaming_mode", False)
+        user_id      = state.get("user_id")
 
         logger.info(f"🚀 Parallel execution (user_id={user_id})")
 
         supervisor_result = self._get_result_with_timeout(
             self.executor.submit(self._safe_execute_supervisor, question, history),
             timeout=20,
-            default={"agent":"FAQ","contextualized_question":question,"is_followup":False,"context_summary":""},
+            default={"agent": "FAQ", "contextualized_question": question,
+                     "is_followup": False, "context_summary": ""},
             name="Supervisor",
         )
 
@@ -132,20 +129,19 @@ class RAGWorkflow:
             faq_result = self._get_result_with_timeout(
                 self.executor.submit(self._safe_execute_faq, contextualized_question, is_followup, context_summary),
                 timeout=10,
-                default={"status":"ERROR","answer":"","references":[]},
+                default={"status": "ERROR", "answer": "", "references": []},
                 name="FAQ",
             )
             if faq_result.get("references"):
                 faq_result["references"] = self._enrich_references_with_urls(faq_result["references"])
 
-        # Retriever uses ACL-aware search when user_id is set
         retriever_result = self._get_result_with_timeout(
             self.executor.submit(
                 self._safe_execute_retriever,
                 question, contextualized_question, is_followup, user_id,
             ),
             timeout=10,
-            default={"status":"ERROR","documents":[]},
+            default={"status": "ERROR", "documents": []},
             name="RETRIEVER",
         )
 
@@ -176,14 +172,15 @@ class RAGWorkflow:
             return self.supervisor.classify_request(question, history)
         except Exception as e:
             logger.error(f"Supervisor error: {e}")
-            return {"agent":"FAQ","contextualized_question":question,"context_summary":"","is_followup":False}
+            return {"agent": "FAQ", "contextualized_question": question,
+                    "context_summary": "", "is_followup": False}
 
     def _safe_execute_faq(self, question, is_followup=False, context_summary=""):
         try:
             return self.faq_agent.process(question=question, is_followup=is_followup, context=context_summary)
         except Exception as e:
             logger.error(f"FAQ error: {e}")
-            return {"status":"ERROR","answer":"","references":[],"next_agent":"RETRIEVER"}
+            return {"status": "ERROR", "answer": "", "references": [], "next_agent": "RETRIEVER"}
 
     def _safe_execute_retriever(self, original_q, contextualized_q, is_followup=False, user_id=None):
         try:
@@ -195,10 +192,10 @@ class RAGWorkflow:
             )
         except Exception as e:
             logger.error(f"RETRIEVER error: {e}")
-            return {"status":"ERROR","documents":[],"next_agent":"NOT_ENOUGH_INFO"}
+            return {"status": "ERROR", "documents": [], "next_agent": "NOT_ENOUGH_INFO"}
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ROUTING NODES  (unchanged except token capture in generator)
+    # NODES
     # ─────────────────────────────────────────────────────────────────────────
 
     def _decision_router_node(self, state):
@@ -210,12 +207,19 @@ class RAGWorkflow:
             state["current_agent"] = supervisor_agent
             return state
         if faq_result.get("status") == "SUCCESS":
-            state.update({"status": faq_result["status"], "answer": faq_result.get("answer",""),
-                          "references": faq_result.get("references",[]), "current_agent": "end"})
+            state.update({
+                "status":     faq_result["status"],
+                "answer":     faq_result.get("answer", ""),
+                "references": faq_result.get("references", []),
+                "current_agent": "end",
+            })
             return state
         if retriever_result.get("documents"):
-            state.update({"documents": retriever_result.get("documents",[]),
-                          "status": retriever_result.get("status","SUCCESS"), "current_agent": "GRADER"})
+            state.update({
+                "documents":     retriever_result.get("documents", []),
+                "status":        retriever_result.get("status", "SUCCESS"),
+                "current_agent": "GRADER",
+            })
             return state
         state["current_agent"] = "NOT_ENOUGH_INFO"
         return state
@@ -224,51 +228,72 @@ class RAGWorkflow:
         try:
             import inspect
             sig    = inspect.signature(self.grader_agent.process)
-            kwargs = dict(question=state.get("original_question", state["question"]),
-                          documents=state.get("documents",[]),
-                          is_followup=state.get("is_followup", False))
+            kwargs = dict(
+                question=state.get("original_question", state["question"]),
+                documents=state.get("documents", []),
+                is_followup=state.get("is_followup", False),
+            )
             if "contextualized_question" in sig.parameters:
                 kwargs["contextualized_question"] = state["question"]
             result = self.grader_agent.process(**kwargs)
             if result.get("references"):
                 result["references"] = self._enrich_references_with_urls(result["references"])
-            state.update({"status": result["status"], "qualified_documents": result.get("qualified_documents",[]),
-                          "references": result.get("references",[]), "current_agent": result.get("next_agent","GENERATOR")})
+            state.update({
+                "status":              result["status"],
+                "qualified_documents": result.get("qualified_documents", []),
+                "references":          result.get("references", []),
+                "current_agent":       result.get("next_agent", "GENERATOR"),
+            })
         except Exception as e:
             logger.error(f"Grader error: {e}")
             state["current_agent"] = "NOT_ENOUGH_INFO"
         return state
 
     def _generator_node(self, state):
+        """
+        Non-streaming generator — captures token_usage via invoke_with_usage.
+        """
         try:
-            # Use invoke_with_usage to capture tokens in non-streaming mode
-            from models.llm_model import llm_model
             result = self.generator_agent.process(
-                question=state["question"], documents=state.get("qualified_documents",[]),
-                references=state.get("references",[]), history=state.get("history",[]),
-                is_followup=state.get("is_followup",False), context_summary=state.get("context_summary",""),
+                question=state["question"],
+                documents=state.get("qualified_documents", []),
+                references=state.get("references", []),
+                history=state.get("history", []),
+                is_followup=state.get("is_followup", False),
+                context_summary=state.get("context_summary", ""),
             )
-            state.update({"status": result["status"], "answer": result.get("answer",""),
-                          "references": result.get("references",[]), "current_agent": "end"})
+            # ✅ Persist token_usage vào state
+            tokens = result.get("token_usage", 0)
+            state.update({
+                "status":      result["status"],
+                "answer":      result.get("answer", ""),
+                "references":  result.get("references", []),
+                "token_usage": {"total_tokens": tokens},
+                "current_agent": "end",
+            })
+            logger.info(f"💰 Generator node: {tokens} tokens")
         except Exception as e:
             logger.error(f"Generator error: {e}")
-            state.update({"answer": "Lỗi tạo câu trả lời", "current_agent": "end"})
+            state.update({"answer": "Lỗi tạo câu trả lời", "current_agent": "end",
+                          "token_usage": {"total_tokens": 0}})
         return state
 
     def _not_enough_info_node(self, state):
         try:
-            result = self.not_enough_info_agent.process(state["question"], is_followup=state.get("is_followup",False))
-            state.update({"status": result["status"], "answer": result.get("answer",""),
-                          "references": result.get("references",[]), "current_agent": "end"})
+            result = self.not_enough_info_agent.process(
+                state["question"], is_followup=state.get("is_followup", False)
+            )
+            state.update({"status": result["status"], "answer": result.get("answer", ""),
+                          "references": result.get("references", []), "current_agent": "end"})
         except Exception as e:
             state["answer"] = "Không tìm thấy thông tin"
         return state
 
     def _chatter_node(self, state):
         try:
-            result = self.chatter_agent.process(state["question"], state.get("history",[]))
-            state.update({"status": result["status"], "answer": result.get("answer",""),
-                          "references": result.get("references",[]), "current_agent": "end"})
+            result = self.chatter_agent.process(state["question"], state.get("history", []))
+            state.update({"status": result["status"], "answer": result.get("answer", ""),
+                          "references": result.get("references", []), "current_agent": "end"})
         except Exception as e:
             state["answer"] = "Tôi hiểu cảm xúc của bạn"
         return state
@@ -276,8 +301,8 @@ class RAGWorkflow:
     def _reporter_node(self, state):
         try:
             result = self.reporter_agent.process(state["question"])
-            state.update({"status": result["status"], "answer": result.get("answer",""),
-                          "references": result.get("references",[]), "current_agent": "end"})
+            state.update({"status": result["status"], "answer": result.get("answer", ""),
+                          "references": result.get("references", []), "current_agent": "end"})
         except Exception as e:
             state["answer"] = "Hệ thống đang bảo trì"
         return state
@@ -285,8 +310,8 @@ class RAGWorkflow:
     def _other_node(self, state):
         try:
             result = self.other_agent.process(state["question"])
-            state.update({"status": result["status"], "answer": result.get("answer",""),
-                          "references": result.get("references",[]), "current_agent": "end"})
+            state.update({"status": result["status"], "answer": result.get("answer", ""),
+                          "references": result.get("references", []), "current_agent": "end"})
         except Exception as e:
             state["answer"] = "Đây không phải tác vụ của tôi"
         return state
@@ -298,7 +323,12 @@ class RAGWorkflow:
     # PUBLIC API
     # ─────────────────────────────────────────────────────────────────────────
 
-    def run(self, question: str, history: List[Dict[str, str]] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    def run(
+        self,
+        question: str,
+        history:  List[Dict[str, str]] = None,
+        user_id:  Optional[str] = None,
+    ) -> Dict[str, Any]:
         try:
             initial = self._create_initial_state(question, history, streaming_mode=False, user_id=user_id)
             final   = self.workflow.invoke(initial)
@@ -306,11 +336,12 @@ class RAGWorkflow:
                 "answer":      final.get("answer", "Lỗi xử lý"),
                 "references":  final.get("references", []),
                 "status":      final.get("status", "ERROR"),
-                "token_usage": final.get("token_usage", {}),
+                "token_usage": final.get("token_usage", {"total_tokens": 0}),
             }
         except Exception as e:
             logger.error(f"Workflow error: {e}", exc_info=True)
-            return {"answer": "Xin lỗi, hệ thống gặp sự cố.", "references": [], "status": "ERROR", "token_usage": {}}
+            return {"answer": "Xin lỗi, hệ thống gặp sự cố.", "references": [],
+                    "status": "ERROR", "token_usage": {"total_tokens": 0}}
 
     async def run_with_streaming(
         self,
@@ -318,24 +349,30 @@ class RAGWorkflow:
         history:  List[Dict[str, str]] = None,
         user_id:  Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Streaming workflow – returns answer_stream async generator + references."""
+        """
+        Streaming workflow.
+        answer_stream yields str chunks, then a final {"__token_usage__": N} dict.
+        api/main.py reads that sentinel and calls track_token_usage().
+        """
         try:
             state = self._create_initial_state(question, history, streaming_mode=True, user_id=user_id)
             state = self._parallel_execution_node(state)
             state = self._decision_router_node(state)
 
-            current_agent   = state.get("current_agent")
+            current_agent    = state.get("current_agent")
             supervisor_agent = state.get("supervisor_classification", {}).get("agent")
 
-            # ── FAQ  ──────────────────────────────────────────────────────────
+            # ── FAQ ──────────────────────────────────────────────────────────
             if supervisor_agent == "FAQ":
                 from tools.vector_search import search_faq, rerank_faq
                 from config.settings import settings as cfg
+
                 faq_results = search_faq.invoke({"query": state["question"]})
                 if not faq_results or "error" in str(faq_results):
                     current_agent = "GRADER"
                 else:
-                    filtered = [f for f in faq_results if f.get("similarity_score",0) >= cfg.FAQ_VECTOR_THRESHOLD]
+                    filtered = [f for f in faq_results
+                                if f.get("similarity_score", 0) >= cfg.FAQ_VECTOR_THRESHOLD]
                     if not filtered:
                         current_agent = "GRADER"
                     else:
@@ -343,14 +380,19 @@ class RAGWorkflow:
                         if not reranked:
                             current_agent = "GRADER"
                         elif reranked[0].get("rerank_score", 0) >= cfg.FAQ_RERANK_THRESHOLD:
+                            # FAQ hit — stream via faq_agent (no heavy token usage, skip tracking)
                             return {
                                 "answer_stream": self.faq_agent.process_streaming(
-                                    question=state["question"], reranked_faqs=reranked,
-                                    is_followup=state.get("is_followup",False), context=state.get("context_summary",""),
+                                    question=state["question"],
+                                    reranked_faqs=reranked,
+                                    is_followup=state.get("is_followup", False),
+                                    context=state.get("context_summary", ""),
                                 ),
-                                "references": [{"document_id": reranked[0].get("faq_id"), "type":"FAQ",
-                                                "description": reranked[0].get("question",""),
-                                                "rerank_score": round(reranked[0].get("rerank_score",0),4)}],
+                                "references": [
+                                    {"document_id": reranked[0].get("faq_id"), "type": "FAQ",
+                                     "description": reranked[0].get("question", ""),
+                                     "rerank_score": round(reranked[0].get("rerank_score", 0), 4)},
+                                ],
                                 "status": "STREAMING",
                             }
                         else:
@@ -360,55 +402,81 @@ class RAGWorkflow:
             if current_agent == "GRADER":
                 state = self._grader_node(state)
                 from config.settings import settings as cfg
+
                 if state.get("current_agent") == "GENERATOR":
+                    # ✅ process_streaming now yields __token_usage__ sentinel
                     return {
                         "answer_stream": self.generator_agent.process_streaming(
-                            question=state["question"], documents=state.get("qualified_documents",[]),
-                            references=state.get("references",[]), history=history or [],
-                            is_followup=state.get("is_followup",False), context_summary=state.get("context_summary",""),
+                            question=state["question"],
+                            documents=state.get("qualified_documents", []),
+                            references=state.get("references", []),
+                            history=history or [],
+                            is_followup=state.get("is_followup", False),
+                            context_summary=state.get("context_summary", ""),
                         ),
                         "references": state.get("references", []),
-                        "status": "STREAMING",
+                        "status":     "STREAMING",
                     }
                 else:
                     return {
                         "answer_stream": self.not_enough_info_agent.process_streaming(
-                            question=state["question"], support_phone=cfg.SUPPORT_PHONE,
+                            question=state["question"],
+                            support_phone=cfg.SUPPORT_PHONE,
                         ),
                         "references": [],
-                        "status": "STREAMING",
+                        "status":     "STREAMING",
                     }
 
-            # ── Other agents ──────────────────────────────────────────────────
+            # ── Other streaming agents ────────────────────────────────────────
             from config.settings import settings as cfg
 
             if current_agent == "CHATTER":
-                return {"answer_stream": self.chatter_agent.process_streaming(
-                            question=state["question"], history=state.get("history",[]), support_phone=cfg.SUPPORT_PHONE),
-                        "references": [{"document_id":"support_contact","type":"SUPPORT"}], "status":"STREAMING"}
+                return {
+                    "answer_stream": self.chatter_agent.process_streaming(
+                        question=state["question"],
+                        history=state.get("history", []),
+                        support_phone=cfg.SUPPORT_PHONE,
+                    ),
+                    "references": [{"document_id": "support_contact", "type": "SUPPORT"}],
+                    "status": "STREAMING",
+                }
 
             if current_agent == "OTHER":
-                return {"answer_stream": self.other_agent.process_streaming(
-                            question=state["question"], support_phone=cfg.SUPPORT_PHONE),
-                        "references": [], "status":"STREAMING"}
+                return {
+                    "answer_stream": self.other_agent.process_streaming(
+                        question=state["question"],
+                        support_phone=cfg.SUPPORT_PHONE,
+                    ),
+                    "references": [],
+                    "status": "STREAMING",
+                }
 
             if current_agent == "REPORTER":
                 state = self._reporter_node(state)
-                answer_text = state.get("answer","")
+                answer_text = state.get("answer", "")
+
                 async def reporter_gen():
                     for word in answer_text.split():
                         yield word + " "
                         await asyncio.sleep(0.01)
-                return {"answer_stream": reporter_gen(), "references": state.get("references",[]), "status": state.get("status","SUCCESS")}
+
+                return {
+                    "answer_stream": reporter_gen(),
+                    "references":    state.get("references", []),
+                    "status":        state.get("status", "SUCCESS"),
+                }
 
             async def error_gen():
                 yield "Xin lỗi, không thể xử lý yêu cầu này."
+
             return {"answer_stream": error_gen(), "references": [], "status": "ERROR"}
 
         except Exception as e:
             logger.error(f"Streaming workflow error: {e}", exc_info=True)
+
             async def error_gen():
                 yield "Xin lỗi, hệ thống gặp sự cố."
+
             return {"answer_stream": error_gen(), "references": [], "status": "ERROR"}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -426,7 +494,7 @@ class RAGWorkflow:
             answer="", status="", iteration_count=0,
             supervisor_classification={}, faq_result={}, retriever_result={},
             parallel_mode=False, streaming_mode=streaming_mode,
-            user_id=user_id, token_usage={},
+            user_id=user_id, token_usage={"total_tokens": 0},
         )
 
     def __del__(self):

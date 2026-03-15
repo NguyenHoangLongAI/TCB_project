@@ -304,14 +304,15 @@ with st.sidebar:
         # Workflow selector
         st.markdown("**Chọn RAG Workflow**")
         workflow_options = {
-            "techcomlife_insurance": "🏦 Chuyên viên tư vấn bảo hiểm Techcomlife",
+            "techcomlife_insurance": "Tori AI Techcomlife",
+            "search_law_TCB": "Search Legal Assistant AI"
         }
         selected = st.selectbox(
             "Workflow", list(workflow_options.keys()),
             format_func=lambda k: workflow_options[k], label_visibility="collapsed",
         )
         st.session_state.workflow = selected
-        st.markdown(f"<small style='color:#5a7fa0;'>Database: <code>default</code></small>", unsafe_allow_html=True)
+        st.markdown(f"<small style='color:#5a7fa0;'>Knowledge Base: <code>Techcomlife documents database</code></small>", unsafe_allow_html=True)
 
         st.markdown("---")
         if st.button("🗑️ Xóa lịch sử chat"):
@@ -443,7 +444,7 @@ elif st.session_state.logged_in:
                 🛡️ Chuyên viên tư vấn bảo hiểm Techcomlife
             </h2>
             <p style="color:#5a7fa0;margin:0;font-size:0.82rem;">
-                AI Workflow · Database: <code>default</code> · 
+                AI Workflow · Knowledge Base: <code>Techcomlife documents database</code> · 
                 User: <strong style="color:#7aabdd;">{user.get('username','')}</strong>
             </p>
         </div>

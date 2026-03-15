@@ -1,4 +1,4 @@
-# RAG_Core/agents/generator_agent.py - FIXED STREAMING VERSION
+# RAG_Core/agents/generator_agent.py - FIXED: capture token usage in streaming
 
 from typing import Dict, Any, List, AsyncIterator
 from models.llm_model import llm_model
@@ -58,206 +58,172 @@ Hãy trả lời như đang tư vấn trực tiếp với khách hàng:"""
 Hãy trả lời:"""
 
     def _deduplicate_references(self, references: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Loại bỏ references trùng lặp"""
         if not references:
             return []
-
         seen_doc_ids = set()
         unique_references = []
-
         for ref in references:
             doc_id = ref.get('document_id')
             if doc_id and doc_id not in seen_doc_ids:
                 seen_doc_ids.add(doc_id)
                 unique_references.append(ref)
-
         return unique_references
 
     def _format_documents(self, documents: List[Dict[str, Any]]) -> str:
-        """Format documents thành text"""
         if not documents:
             return "Không có tài liệu tham khảo"
-
         doc_lines = []
         for i, doc in enumerate(documents[:5], 1):
             description = doc.get('description', '')
             score = doc.get('similarity_score', 0)
             doc_lines.append(f"[Tài liệu {i}] (Độ liên quan: {score:.2f})\n{description}")
-
         return "\n\n".join(doc_lines)
 
     def _format_history(self, history: List, max_turns: int = 2) -> str:
-        """Format lịch sử hội thoại"""
         if not history:
             return "Không có lịch sử"
-
         normalized_history = []
         for msg in history:
             if isinstance(msg, dict):
-                normalized_history.append({
-                    "role": msg.get("role", ""),
-                    "content": msg.get("content", "")
-                })
+                normalized_history.append({"role": msg.get("role", ""), "content": msg.get("content", "")})
             else:
-                normalized_history.append({
-                    "role": getattr(msg, "role", ""),
-                    "content": getattr(msg, "content", "")
-                })
-
-        recent_history = normalized_history[-(max_turns * 2):] if len(
-            normalized_history) > max_turns * 2 else normalized_history
-
+                normalized_history.append({"role": getattr(msg, "role", ""), "content": getattr(msg, "content", "")})
+        recent_history = normalized_history[-(max_turns * 2):] if len(normalized_history) > max_turns * 2 else normalized_history
         history_lines = []
         for msg in recent_history:
             role = "👤 Khách hàng" if msg.get("role") == "user" else "🤖 Trợ lý Techcomlife"
             content = msg.get("content", "")
             if content:
                 history_lines.append(f"{role}: {content}")
-
         return "\n".join(history_lines) if history_lines else "Không có lịch sử"
 
     def _extract_context_summary(self, history: List) -> str:
-        """Trích xuất context summary"""
         if not history or len(history) < 2:
             return "Đây là câu hỏi đầu tiên"
-
         normalized_history = []
         for msg in history:
             if isinstance(msg, dict):
                 normalized_history.append(msg)
             else:
-                normalized_history.append({
-                    "role": getattr(msg, "role", ""),
-                    "content": getattr(msg, "content", "")
-                })
-
+                normalized_history.append({"role": getattr(msg, "role", ""), "content": getattr(msg, "content", "")})
         for i in range(len(normalized_history) - 1, -1, -1):
             if normalized_history[i].get("role") == "user":
                 prev_question = normalized_history[i].get("content", "")
-
                 for j in range(i + 1, len(normalized_history)):
                     if normalized_history[j].get("role") == "assistant":
                         prev_answer = normalized_history[j].get("content", "")
                         return f"Chủ đề đang thảo luận: {prev_question}\nĐã trả lời: {prev_answer[:200]}..."
-
                 return f"Chủ đề đang thảo luận: {prev_question}"
-
         return "Đang trong cuộc trò chuyện"
 
+    def _build_prompt(
+        self,
+        question: str,
+        documents: List[Dict[str, Any]],
+        history: List,
+        is_followup: bool,
+        context_summary: str,
+    ) -> str:
+        doc_text     = self._format_documents(documents)
+        history_text = self._format_history(history or [], max_turns=2)
+        if is_followup:
+            if not context_summary:
+                context_summary = self._extract_context_summary(history or [])
+            return self.followup_prompt.format(
+                question=question,
+                context_summary=context_summary,
+                recent_history=history_text,
+                documents=doc_text,
+            )
+        return self.standard_prompt.format(
+            question=question,
+            history=history_text,
+            documents=doc_text,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # NON-STREAMING  — uses invoke_with_usage to capture tokens
+    # ──────────────────────────────────────────────────────────────────────────
+
     def process(
-            self,
-            question: str,
-            documents: List[Dict[str, Any]],
-            references: List[Dict[str, Any]] = None,
-            history: List[Dict[str, str]] = None,
-            is_followup: bool = False,
-            context_summary: str = "",
-            **kwargs
+        self,
+        question: str,
+        documents: List[Dict[str, Any]],
+        references: List[Dict[str, Any]] = None,
+        history: List[Dict[str, str]] = None,
+        is_followup: bool = False,
+        context_summary: str = "",
+        **kwargs,
     ) -> Dict[str, Any]:
-        """Non-streaming generation (original)"""
         try:
             if not documents:
-                return {
-                    "status": "ERROR",
-                    "answer": "Không có tài liệu để tạo câu trả lời",
-                    "references": [],
-                    "next_agent": "end"
-                }
+                return {"status": "ERROR", "answer": "Không có tài liệu để tạo câu trả lời",
+                        "references": [], "token_usage": 0, "next_agent": "end"}
 
-            doc_text = self._format_documents(documents)
-            history_text = self._format_history(history or [], max_turns=2)
+            prompt = self._build_prompt(question, documents, history, is_followup, context_summary)
 
-            if is_followup:
-                if not context_summary:
-                    context_summary = self._extract_context_summary(history or [])
-
-                prompt = self.followup_prompt.format(
-                    question=question,
-                    context_summary=context_summary,
-                    recent_history=history_text,
-                    documents=doc_text
-                )
-            else:
-                prompt = self.standard_prompt.format(
-                    question=question,
-                    history=history_text,
-                    documents=doc_text
-                )
-
-            answer = llm_model.invoke(prompt)
+            # ✅ Capture tokens
+            answer, total_tokens = llm_model.invoke_with_usage(prompt)
 
             if not answer or len(answer.strip()) < 10:
                 answer = "Tôi đã tìm thấy thông tin liên quan nhưng gặp khó khăn trong việc tạo câu trả lời. Vui lòng liên hệ hotline Techcomlife để được hỗ trợ trực tiếp."
 
-            unique_references = self._deduplicate_references(references or [])
-
+            logger.info(f"✅ Generator (non-streaming): {total_tokens} tokens")
             return {
-                "status": "SUCCESS",
-                "answer": answer,
-                "references": unique_references,
-                "next_agent": "end"
+                "status":      "SUCCESS",
+                "answer":      answer,
+                "references":  self._deduplicate_references(references or []),
+                "token_usage": total_tokens,   # ✅ trả về cho workflow
+                "next_agent":  "end",
             }
 
         except Exception as e:
             logger.error(f"Error in generator agent: {e}", exc_info=True)
-            return {
-                "status": "ERROR",
-                "answer": f"Lỗi tạo câu trả lời: {str(e)}",
-                "references": [],
-                "next_agent": "end"
-            }
+            return {"status": "ERROR", "answer": f"Lỗi tạo câu trả lời: {str(e)}",
+                    "references": [], "token_usage": 0, "next_agent": "end"}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STREAMING  — uses astream_with_usage to capture tokens
+    # ──────────────────────────────────────────────────────────────────────────
 
     async def process_streaming(
-            self,
-            question: str,
-            documents: List[Dict[str, Any]],
-            references: List[Dict[str, Any]] = None,
-            history: List[Dict[str, str]] = None,
-            is_followup: bool = False,
-            context_summary: str = "",
-            **kwargs
-    ) -> AsyncIterator[str]:
+        self,
+        question: str,
+        documents: List[Dict[str, Any]],
+        references: List[Dict[str, Any]] = None,
+        history: List[Dict[str, str]] = None,
+        is_followup: bool = False,
+        context_summary: str = "",
+        **kwargs,
+    ) -> AsyncIterator:
         """
-        FIXED: Streaming generation with proper async/await
+        Streaming generation.
+        Yields str chunks, rồi cuối cùng yield dict {"__token_usage__": N}
+        để api/main.py có thể capture và track.
         """
         try:
-            logger.info(f"🚀 Generator: Starting streaming for: {question[:50]}...")
+            logger.info(f"🚀 Generator streaming: {question[:50]}...")
 
             if not documents:
                 yield "Không có tài liệu để tạo câu trả lời."
+                yield {"__token_usage__": 0}
                 return
 
-            doc_text = self._format_documents(documents)
-            history_text = self._format_history(history or [], max_turns=2)
-
-            if is_followup:
-                if not context_summary:
-                    context_summary = self._extract_context_summary(history or [])
-
-                prompt = self.followup_prompt.format(
-                    question=question,
-                    context_summary=context_summary,
-                    recent_history=history_text,
-                    documents=doc_text
-                )
-            else:
-                prompt = self.standard_prompt.format(
-                    question=question,
-                    history=history_text,
-                    documents=doc_text
-                )
-
-            logger.info(f"📝 Generator: Prompt prepared, length={len(prompt)}")
+            prompt = self._build_prompt(question, documents, history, is_followup, context_summary)
+            logger.info(f"📝 Generator prompt length={len(prompt)}")
 
             chunk_count = 0
-            async for chunk in llm_model.astream(prompt):
-                if chunk:
+            # ✅ Dùng astream_with_usage thay vì astream
+            async for item in llm_model.astream_with_usage(prompt):
+                if isinstance(item, dict) and "__token_usage__" in item:
+                    # Sentinel cuối stream — forward lên cho api/main.py
+                    logger.info(f"✅ Generator streaming done: {item['__token_usage__']} tokens, {chunk_count} chunks")
+                    yield item
+                elif isinstance(item, str) and item:
                     chunk_count += 1
-                    logger.debug(f"Generator yielding chunk #{chunk_count}: {chunk[:30]}...")
-                    yield chunk
-
-            logger.info(f"✅ Generator: Completed streaming {chunk_count} chunks")
+                    yield item
 
         except Exception as e:
             logger.error(f"❌ Generator streaming error: {e}", exc_info=True)
             yield f"\n\n[Lỗi: {str(e)}]"
+            yield {"__token_usage__": 0}
