@@ -1,16 +1,36 @@
-# Embedding_vectorDB/milvus_client.py  (UPDATED – user_groups + ACL)
+# Embedding_vectorDB/milvus_client.py  (UPDATED v5 – user_groups tách sang user_db)
 """
-Unified Milvus Manager – adds user_groups collection and
-permission-aware document_embeddings (group/company/dept/user_id fields).
+Unified Milvus Manager cho document/FAQ/URL collections.
+
+Thay đổi so với v4:
+  - user_groups collection ĐÃ ĐƯỢC TÁCH ra user_db_manager.py / UserDBManager
+  - MilvusManager chỉ quản lý:
+      • document_embeddings  (default db)
+      • faq_embeddings       (default db)
+      • document_urls        (default db)
+  - Mọi thao tác user (create_user, get_user, authenticate, update_token_cost)
+    đều delegate sang user_db_manager singleton
+
+Architecture:
+    Milvus
+    ├── default (db)
+    │   ├── document_embeddings
+    │   ├── faq_embeddings
+    │   └── document_urls
+    └── user_db (db)          ← quản lý bởi UserDBManager
+        └── user_groups
 """
 
 from pymilvus import (
-    connections, Collection, FieldSchema, CollectionSchema, DataType, utility
+    connections, Collection, FieldSchema, CollectionSchema, DataType, utility, db
 )
 from typing import List, Dict, Any, Optional
 import asyncio
 import logging
 import os
+
+# Import UserDBManager thay vì tự quản lý user collection
+from user_db_manager import get_user_db_manager, UserDBManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,15 +43,14 @@ class MilvusManager:
         self.port = port
         self.embedding_dim = embedding_dim
 
+        # Collections trong default database
         self.doc_collection_name  = "document_embeddings"
         self.faq_collection_name  = "faq_embeddings"
         self.url_collection_name  = "document_urls"
-        self.ug_collection_name   = "user_groups"
 
         self.doc_collection = None
         self.faq_collection = None
         self.url_collection = None
-        self.ug_collection  = None
 
         self.is_initialized = False
 
@@ -43,14 +62,34 @@ class MilvusManager:
 
         self._embedding_model = None
 
+        # user_db_manager – lazy init (tránh double-connect lúc startup)
+        self._user_db_manager: Optional[UserDBManager] = None
+
     # ──────────────────────────────────────────────
-    # CONNECTION
+    # USER DB  (delegate sang UserDBManager)
+    # ──────────────────────────────────────────────
+
+    @property
+    def user_mgr(self) -> UserDBManager:
+        """Lazy-init UserDBManager singleton (kết nối tới user_db)."""
+        if self._user_db_manager is None:
+            self._user_db_manager = get_user_db_manager(
+                host=self.host, port=self.port
+            )
+        return self._user_db_manager
+
+    # ──────────────────────────────────────────────
+    # CONNECTION  (chỉ kết nối cho default db)
     # ──────────────────────────────────────────────
 
     async def initialize(self, max_retries: int = 5, retry_delay: int = 2):
         for attempt in range(max_retries):
             try:
-                logger.info(f"Connecting to Milvus {self.host}:{self.port} (attempt {attempt+1}/{max_retries})")
+                logger.info(
+                    f"Connecting to Milvus {self.host}:{self.port} "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                # Resolve hostname inside Docker
                 if self.host == "milvus":
                     import socket
                     try:
@@ -58,23 +97,38 @@ class MilvusManager:
                     except socket.gaierror:
                         self.host = "localhost"
                         logger.warning("Running outside Docker → localhost")
+
                 try:
                     connections.disconnect("default")
                 except Exception:
                     pass
-                connections.connect("default", host=self.host, port=self.port)
-                logger.info(f"✅ Connected to Milvus {self.host}:{self.port}")
 
+                connections.connect("default", host=self.host, port=self.port)
+
+                # Đảm bảo ở đúng database (default cho document/faq/url)
+                try:
+                    db.using_database("default")
+                except Exception:
+                    pass
+
+                logger.info(f"✅ Connected to Milvus (default db) {self.host}:{self.port}")
+
+                # Tạo collections trong default db
                 await self.create_document_collection()
                 await self.create_faq_collection()
                 await self.create_url_collection()
-                await self.create_user_groups_collection()
+
+                # Khởi tạo user_db_manager (tạo/load user_db.user_groups)
+                logger.info("🔄 Initializing UserDBManager (user_db) …")
+                _ = self.user_mgr
+                logger.info("✅ UserDBManager ready (database: user_db)")
 
                 self.is_initialized = True
-                logger.info("✅ Milvus initialization complete")
+                logger.info("✅ MilvusManager initialization complete")
                 return True
+
             except Exception as e:
-                logger.error(f"❌ Init error (attempt {attempt+1}): {e}")
+                logger.error(f"❌ Init error (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                 else:
@@ -94,7 +148,9 @@ class MilvusManager:
         if self._embedding_model is None:
             from sentence_transformers import SentenceTransformer
             logger.info("Loading Vietnamese SBERT (CPU) …")
-            self._embedding_model = SentenceTransformer("keepitreal/vietnamese-sbert", device="cpu")
+            self._embedding_model = SentenceTransformer(
+                "keepitreal/vietnamese-sbert", device="cpu"
+            )
             logger.info("✅ Embedding model ready")
         return self._embedding_model
 
@@ -102,17 +158,19 @@ class MilvusManager:
         try:
             if not text or not text.strip():
                 return [0.0] * self.embedding_dim
-            return self.embedding_model.encode(text.strip(), normalize_embeddings=True).tolist()
+            return self.embedding_model.encode(
+                text.strip(), normalize_embeddings=True
+            ).tolist()
         except Exception as e:
             logger.error(f"Embedding error: {e}")
             return [0.0] * self.embedding_dim
 
     # ──────────────────────────────────────────────
-    # COLLECTION CREATION
+    # COLLECTION CREATION  (default db only)
     # ──────────────────────────────────────────────
 
     async def create_document_collection(self):
-        """document_embeddings – now includes ACL fields."""
+        """document_embeddings – ACL fields."""
         try:
             if utility.has_collection(self.doc_collection_name):
                 logger.info(f"Collection {self.doc_collection_name} exists – loading.")
@@ -123,23 +181,31 @@ class MilvusManager:
 
             logger.info(f"Creating {self.doc_collection_name} …")
             fields = [
-                FieldSchema(name="id",              dtype=DataType.VARCHAR, max_length=200, is_primary=True),
-                FieldSchema(name="document_id",     dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="description",     dtype=DataType.VARCHAR, max_length=65000),
-                FieldSchema(name="description_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
-                # ── ACL fields ──────────────────────────────────────────────
-                FieldSchema(name="acl_group_id",      dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="acl_company_id",    dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="acl_department_id", dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="acl_user_id",       dtype=DataType.VARCHAR, max_length=100),
-                # ── upload owner ────────────────────────────────────────────
-                FieldSchema(name="uploaded_by",       dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="id",                    dtype=DataType.VARCHAR, max_length=200, is_primary=True),
+                FieldSchema(name="document_id",           dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="description",           dtype=DataType.VARCHAR, max_length=65000),
+                FieldSchema(name="description_vector",    dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
+                # ACL fields (tham chiếu tới user_db.user_groups)
+                FieldSchema(name="acl_group_id",          dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_company_id",        dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_department_id",     dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="acl_user_id",           dtype=DataType.VARCHAR, max_length=100),
+                FieldSchema(name="uploaded_by",           dtype=DataType.VARCHAR, max_length=100),
             ]
-            schema = CollectionSchema(fields, description="Document embeddings (768D) + ACL")
-            self.doc_collection = Collection(self.doc_collection_name, schema=schema, using="default")
+            schema = CollectionSchema(
+                fields,
+                description="Document embeddings (768D) + ACL (refs user_db.user_groups)",
+            )
+            self.doc_collection = Collection(
+                self.doc_collection_name, schema=schema, using="default"
+            )
             self.doc_collection.create_index(
                 field_name="description_vector",
-                index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
+                index_params={
+                    "metric_type": "COSINE",
+                    "index_type": "HNSW",
+                    "params": {"M": 16, "efConstruction": 200},
+                },
             )
             self.doc_collection.load()
             logger.info(f"✅ {self.doc_collection_name} created with ACL fields.")
@@ -163,10 +229,16 @@ class MilvusManager:
                 FieldSchema(name="question_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
             ]
             schema = CollectionSchema(fields, description="FAQ embeddings (768D)")
-            self.faq_collection = Collection(self.faq_collection_name, schema=schema, using="default")
+            self.faq_collection = Collection(
+                self.faq_collection_name, schema=schema, using="default"
+            )
             self.faq_collection.create_index(
                 field_name="question_vector",
-                index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
+                index_params={
+                    "metric_type": "COSINE",
+                    "index_type": "HNSW",
+                    "params": {"M": 16, "efConstruction": 200},
+                },
             )
             self.faq_collection.load()
             logger.info(f"✅ {self.faq_collection_name} created.")
@@ -190,46 +262,21 @@ class MilvusManager:
                 FieldSchema(name="filename_vector", dtype=DataType.FLOAT_VECTOR, dim=self.embedding_dim),
             ]
             schema = CollectionSchema(fields, description="Document URLs + filename embeddings")
-            self.url_collection = Collection(self.url_collection_name, schema=schema, using="default")
+            self.url_collection = Collection(
+                self.url_collection_name, schema=schema, using="default"
+            )
             self.url_collection.create_index(
                 field_name="filename_vector",
-                index_params={"metric_type": "COSINE", "index_type": "IVF_FLAT", "params": {"nlist": 128}},
+                index_params={
+                    "metric_type": "COSINE",
+                    "index_type": "IVF_FLAT",
+                    "params": {"nlist": 128},
+                },
             )
             self.url_collection.load()
             logger.info(f"✅ {self.url_collection_name} created.")
         except Exception as e:
             logger.error(f"❌ create_url_collection: {e}")
-            raise
-
-    async def create_user_groups_collection(self):
-        """user_groups collection (4-level ACL + token cost)."""
-        try:
-            if utility.has_collection(self.ug_collection_name):
-                logger.info(f"Collection {self.ug_collection_name} exists – loading.")
-                self.ug_collection = Collection(self.ug_collection_name)
-                self.ug_collection.load()
-                return
-
-            fields = [
-                FieldSchema(name="user_id",        dtype=DataType.VARCHAR, max_length=100, is_primary=True),
-                FieldSchema(name="group_id",        dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="company_id",      dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="department_id",   dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="username",        dtype=DataType.VARCHAR, max_length=100),
-                FieldSchema(name="password_hash",   dtype=DataType.VARCHAR, max_length=256),
-                FieldSchema(name="cost_llm_tokens", dtype=DataType.INT64),
-                FieldSchema(name="dummy_vector",    dtype=DataType.FLOAT_VECTOR, dim=2),
-            ]
-            schema = CollectionSchema(fields, description="User groups + access control (4-level)")
-            self.ug_collection = Collection(self.ug_collection_name, schema=schema, using="default")
-            self.ug_collection.create_index(
-                field_name="dummy_vector",
-                index_params={"metric_type": "L2", "index_type": "FLAT", "params": {}},
-            )
-            self.ug_collection.load()
-            logger.info(f"✅ {self.ug_collection_name} created.")
-        except Exception as e:
-            logger.error(f"❌ create_user_groups_collection: {e}")
             raise
 
     async def _optimize_collection_index(self, collection: Collection, vector_field: str):
@@ -239,7 +286,11 @@ class MilvusManager:
                 collection.release()
                 collection.create_index(
                     field_name=vector_field,
-                    index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
+                    index_params={
+                        "metric_type": "COSINE",
+                        "index_type": "HNSW",
+                        "params": {"M": 16, "efConstruction": 200},
+                    },
                 )
                 collection.load()
                 return
@@ -249,7 +300,11 @@ class MilvusManager:
                     collection.drop_index()
                     collection.create_index(
                         field_name=vector_field,
-                        index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}},
+                        index_params={
+                            "metric_type": "COSINE",
+                            "index_type": "HNSW",
+                            "params": {"M": 16, "efConstruction": 200},
+                        },
                     )
                     collection.load()
                     return
@@ -266,11 +321,7 @@ class MilvusManager:
         acl: Optional[Dict[str, str]] = None,
         uploaded_by: str = "",
     ) -> int:
-        """
-        Insert embeddings with optional ACL.
-        acl = { group_id, company_id, department_id, user_id }
-        Empty string = wildcard.
-        """
+        """Insert embeddings với ACL. ACL values lấy từ user_db.user_groups."""
         self._check_initialized()
         if not self.doc_collection or not embeddings_data:
             return 0
@@ -281,7 +332,11 @@ class MilvusManager:
         acl_department = (acl.get("department_id", "") or "")[:100]
         acl_user       = (acl.get("user_id",       "") or "")[:100]
 
-        field_limits = {"id": self.max_id_length, "document_id": self.max_document_id_length, "description": self.max_description_length}
+        field_limits = {
+            "id":          self.max_id_length,
+            "document_id": self.max_document_id_length,
+            "description": self.max_description_length,
+        }
         validated = [
             self._validate_and_truncate(item, field_limits)
             for item in embeddings_data
@@ -291,10 +346,10 @@ class MilvusManager:
         if not validated:
             return 0
 
-        batch_size    = 100
+        batch_size     = 100
         total_inserted = 0
         for i in range(0, len(validated), batch_size):
-            batch = validated[i : i + batch_size]
+            batch = validated[i: i + batch_size]
             entities = [
                 [r["id"]          for r in batch],
                 [r["document_id"] for r in batch],
@@ -332,12 +387,15 @@ class MilvusManager:
     async def insert_faq(self, faq_id, question, answer, question_vector) -> bool:
         self._check_initialized()
         try:
-            if len(faq_id) > 90:           faq_id   = faq_id[:90]
-            if len(question) > self.max_question_length: question = question[:self.max_question_length-3] + "..."
-            if len(answer)   > self.max_answer_length:   answer   = answer[:self.max_answer_length-3]   + "..."
+            if len(faq_id) > 90:
+                faq_id = faq_id[:90]
+            if len(question) > self.max_question_length:
+                question = question[: self.max_question_length - 3] + "..."
+            if len(answer) > self.max_answer_length:
+                answer = answer[: self.max_answer_length - 3] + "..."
             if len(question_vector) != self.embedding_dim:
                 return False
-            self.faq_collection.insert([[faq_id],[question],[answer],[question_vector]])
+            self.faq_collection.insert([[faq_id], [question], [answer], [question_vector]])
             self.faq_collection.flush()
             return True
         except Exception as e:
@@ -361,15 +419,24 @@ class MilvusManager:
         try:
             if not self.url_collection:
                 return False
-            document_id = document_id[:100]; url = url[:500]; filename = filename[:200]; file_type = file_type[:20]
+            document_id = document_id[:100]
+            url         = url[:500]
+            filename    = filename[:200]
+            file_type   = file_type[:20]
             vec = self.embed_text(filename)
             try:
-                existing = self.url_collection.query(expr=f'document_id == "{document_id}"', output_fields=["document_id"], limit=1)
+                existing = self.url_collection.query(
+                    expr=f'document_id == "{document_id}"',
+                    output_fields=["document_id"],
+                    limit=1,
+                )
                 if existing:
                     self.url_collection.delete(f'document_id in ["{document_id}"]')
             except Exception:
                 pass
-            self.url_collection.insert([[document_id],[url],[filename],[file_type],[vec]])
+            self.url_collection.insert(
+                [[document_id], [url], [filename], [file_type], [vec]]
+            )
             self.url_collection.flush()
             return True
         except Exception as e:
@@ -389,7 +456,8 @@ class MilvusManager:
         try:
             results = self.url_collection.query(
                 expr=f'document_id == "{document_id}"',
-                output_fields=["url","filename","file_type"], limit=1,
+                output_fields=["url", "filename", "file_type"],
+                limit=1,
             )
             if results:
                 return {"document_id": document_id, **results[0]}
@@ -399,45 +467,20 @@ class MilvusManager:
             return None
 
     # ──────────────────────────────────────────────
-    # USER GROUPS
+    # USER GROUPS  (delegate → UserDBManager / user_db)
     # ──────────────────────────────────────────────
 
     def get_user(self, user_id: str) -> Optional[Dict]:
-        try:
-            results = self.ug_collection.query(
-                expr=f'user_id == "{user_id}"',
-                output_fields=["user_id","group_id","company_id","department_id","username","cost_llm_tokens"],
-                limit=1,
-            )
-            return results[0] if results else None
-        except Exception as e:
-            logger.error(f"get_user error: {e}")
-            return None
+        """Proxy tới user_db_manager.get_user()."""
+        return self.user_mgr.get_user(user_id)
 
     def update_token_cost(self, user_id: str, tokens_used: int) -> bool:
-        """Read-modify-write (Milvus does not support in-place update)."""
-        try:
-            full = self.ug_collection.query(
-                expr=f'user_id == "{user_id}"',
-                output_fields=["user_id","group_id","company_id","department_id",
-                                "username","password_hash","cost_llm_tokens"],
-                limit=1,
-            )
-            if not full:
-                return False
-            r = full[0]
-            new_total = r.get("cost_llm_tokens", 0) + tokens_used
-            self.ug_collection.delete(f'user_id in ["{user_id}"]')
-            self.ug_collection.insert([
-                [r["user_id"]], [r["group_id"]], [r["company_id"]], [r["department_id"]],
-                [r["username"]], [r["password_hash"]], [new_total], [[0.0, 0.0]],
-            ])
-            self.ug_collection.flush()
-            logger.info(f"✅ Token cost updated: {user_id} → {new_total}")
-            return True
-        except Exception as e:
-            logger.error(f"update_token_cost error: {e}")
-            return False
+        """Proxy tới user_db_manager.update_token_cost()."""
+        return self.user_mgr.update_token_cost(user_id, tokens_used)
+
+    def get_user_permissions(self, user_id: str) -> Optional[Dict[str, str]]:
+        """Proxy tới user_db_manager.get_user_permissions()."""
+        return self.user_mgr.get_user_permissions(user_id)
 
     # ──────────────────────────────────────────────
     # UTILITIES
@@ -466,13 +509,19 @@ class MilvusManager:
             ("document_embeddings", self.doc_collection),
             ("faq_embeddings",      self.faq_collection),
             ("document_urls",       self.url_collection),
-            ("user_groups",         self.ug_collection),
         ]:
             if col:
                 try:
-                    stats[name] = {"count": col.num_entities}
+                    stats[name] = {"count": col.num_entities, "database": "default"}
                 except Exception:
                     stats[name] = {"count": "?"}
+
+        # user_groups stats từ user_db
+        try:
+            stats["user_groups"] = self.user_mgr.get_database_info()
+        except Exception:
+            stats["user_groups"] = {"database": "user_db", "count": "?"}
+
         return stats
 
 
